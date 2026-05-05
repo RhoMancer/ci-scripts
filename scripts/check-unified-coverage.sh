@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # check-unified-coverage.sh — Enforce combined coverage thresholds from UNIFIED_COVERAGE.md
 #
 # Usage: ./scripts/check-unified-coverage.sh [report-path] [min-line%] [min-branch%]
@@ -8,7 +8,7 @@
 # Falls back to Kover-only metrics if no combined data is available.
 # Exits non-zero if coverage is below thresholds.
 
-set -euo pipefail
+set -e
 
 REPORT="${1:-shared/build/reports/coverage/UNIFIED_COVERAGE.md}"
 MIN_LINE="${2:-80}"

@@ -1,10 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # test-summary.sh — Print test results summary from JUnit XML files
 #
 # Usage: ./scripts/test-summary.sh <xml-glob-pattern>
 # Example: ./scripts/test-summary.sh "shared/build/outputs/androidTest-results/connected/debug/TEST-*.xml"
 
-set -euo pipefail
+set -e
 
 PATTERN="${1:-}"
 
