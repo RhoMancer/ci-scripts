@@ -35,8 +35,11 @@ while IFS= read -r line; do
     SHA="${line%% *}"
     MSG="${line#* }"
 
-    # Skip merge commits
+    # Skip merge commits (pull requests, branches, remotes, and SHA-to-SHA auto-merges)
     if [[ "$MSG" =~ ^Merge\ (pull\ request|branch|remote) ]]; then
+        continue
+    fi
+    if [[ "$MSG" =~ ^Merge\ [0-9a-f]+\ into\ [0-9a-f]+$ ]]; then
         continue
     fi
 
