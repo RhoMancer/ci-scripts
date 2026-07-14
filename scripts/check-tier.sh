@@ -1,20 +1,49 @@
 #!/bin/sh
 # check-tier.sh — Determine a repo's testing tier from JaCoCo + PIT XML reports.
-# Usage: check-tier.sh <jacoco-xml> <pit-xml> [test-loc] [test-count] [test-time-ms]
+# Usage: check-tier.sh [--floor <tier>] <jacoco-xml> <pit-xml> [test-loc] [test-count] [test-time-ms]
+#
+# --floor <tier> : Minimum tier required (default: Gold). Build fails if below.
+#                  Valid: Bronze, Silver, Gold, Platinum, Diamond, Perfection
 #
 # Outputs: tier name + per-metric breakdown.
-# Exit code: 0 if tier >= Gold, 1 if below Gold, 2 if reports missing.
+# Exit code: 0 if tier >= floor, 1 if below floor, 2 if reports missing.
 #
 # Part of the Angus Software Testing Tier System.
 # See: TEST_TIER_SYSTEM.md for full definitions.
 
-set -e
+JACOCO_XML=""
+PIT_XML=""
+TEST_LOC=""
+TEST_COUNT=""
+TEST_TIME_MS=""
+FLOOR_TIER="Gold"
 
-JACOCO_XML="${1:-gradle-tools/build/reports/jacoco/test/jacocoTestReport.xml}"
-PIT_XML="${2:-gradle-tools/build/reports/pitest/mutations.xml}"
-TEST_LOC="${3:-}"
-TEST_COUNT="${4:-}"
-TEST_TIME_MS="${5:-}"
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --floor)
+            FLOOR_TIER="$2"
+            shift 2
+            ;;
+        *)
+            if [ -z "$JACOCO_XML" ]; then
+                JACOCO_XML="$1"
+            elif [ -z "$PIT_XML" ]; then
+                PIT_XML="$1"
+            elif [ -z "$TEST_LOC" ]; then
+                TEST_LOC="$1"
+            elif [ -z "$TEST_COUNT" ]; then
+                TEST_COUNT="$1"
+            elif [ -z "$TEST_TIME_MS" ]; then
+                TEST_TIME_MS="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+JACOCO_XML="${JACOCO_XML:-gradle-tools/build/reports/jacoco/test/jacocoTestReport.xml}"
+PIT_XML="${PIT_XML:-gradle-tools/build/reports/pitest/mutations.xml}"
 
 # Check files exist
 if [ ! -f "$JACOCO_XML" ]; then
@@ -33,7 +62,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 2
 fi
 
-python3 - "$JACOCO_XML" "$PIT_XML" "$TEST_LOC" "$TEST_COUNT" "$TEST_TIME_MS" << 'PYEOF'
+python3 - "$JACOCO_XML" "$PIT_XML" "$TEST_LOC" "$TEST_COUNT" "$TEST_TIME_MS" "$FLOOR_TIER" << 'PYEOF'
 import xml.etree.ElementTree as ET
 import sys
 import os
@@ -43,6 +72,7 @@ pit_path = sys.argv[2]
 test_loc_str = sys.argv[3] if len(sys.argv) > 3 else ""
 test_count_str = sys.argv[4] if len(sys.argv) > 4 else ""
 test_time_str = sys.argv[5] if len(sys.argv) > 5 else ""
+floor_tier = sys.argv[6] if len(sys.argv) > 6 else "Gold"
 
 # ============ Parse JaCoCo ============
 jacoco_tree = ET.parse(jacoco_path)
@@ -299,11 +329,13 @@ print("=" * 60)
 print(f"  TIER: {achieved_tier}")
 print("=" * 60)
 
-# Exit code
+# Exit code: 0 if achieved tier >= floor tier, 1 if below
 tier_order = ["Below Bronze", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Perfection"]
 tier_idx = tier_order.index(achieved_tier) if achieved_tier in tier_order else 0
-if tier_idx >= 2:  # Gold or above
+floor_idx = tier_order.index(floor_tier) if floor_tier in tier_order else 3  # default Gold
+if tier_idx >= floor_idx:
     sys.exit(0)
 else:
+    print(f"\n  FAILED: Tier {achieved_tier} is below floor {floor_tier}")
     sys.exit(1)
 PYEOF
