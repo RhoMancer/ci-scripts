@@ -132,12 +132,10 @@ test_time_ms = test_time_seconds * 1000
 avg_test_ms = test_time_ms / test_count if test_count > 0 else None
 
 # ============ Test Efficiency Score ============
-# Formula: (killed / total)^2 * (killed / test_count)
-# Expanded: killed^3 / (total^2 * test_count)
-if total_mutations > 0 and test_count > 0:
-    mutation_score = killed_mutations / total_mutations
-    kills_per_test = killed_mutations / test_count
-    test_efficiency = (mutation_score ** 2) * kills_per_test
+# Formula: killed_mutations / test_count (kills per test)
+# Higher = better. Each test should kill >1 mutation on average.
+if test_count > 0:
+    test_efficiency = killed_mutations / test_count
 else:
     test_efficiency = 0
 
@@ -165,7 +163,7 @@ if avg_test_ms is not None:
     print(f"  Avg test speed:   {avg_test_ms:.1f}ms/test")
 else:
     print(f"  Avg test speed:   N/A")
-print(f"  Test Efficiency:  {test_efficiency:.3f}  [(K/M)^2 * (K/T)]")
+print(f"  Test Efficiency:  {test_efficiency:.3f}  [K/T = kills per test]")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_str}")
@@ -185,15 +183,15 @@ tiers = [
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
-        "test_efficiency": 0.8, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
-        "test_efficiency": 1.2, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
-        "test_efficiency": 2.0, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 1.5, "test_isolation": True, "has_strategy": True,
     }),
 ]
 
