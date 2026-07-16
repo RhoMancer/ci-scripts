@@ -302,35 +302,38 @@ print()
 # ============ Determine Tier ============
 tiers = [
     ("Bronze", {
-        "instruction": 50, "branch": 40, "exclusion_ratio": 5,
-        "zero_kill_ratio": 80,
+        "instruction": 50, "branch": 40, "mutation": 20,
+        "test_efficiency": 0.1, "exclusion_ratio": 5,
+        "zero_kill_ratio": 85, "unit_speed": 200, "instrumented_speed": 10000,
     }),
     ("Silver", {
-        "instruction": 70, "branch": 60, "exclusion_ratio": 5,
-        "zero_kill_ratio": 70,
+        "instruction": 70, "branch": 60, "mutation": 35,
+        "test_efficiency": 0.2, "exclusion_ratio": 5,
+        "zero_kill_ratio": 75, "unit_speed": 100, "instrumented_speed": 5000,
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "test_efficiency": 0.5, "test_isolation": True, "exclusion_ratio": 5,
-        "zero_kill_ratio": 60,
+        "test_efficiency": 0.5, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 3, "zero_kill_ratio": 65,
+        "unit_speed": 50, "instrumented_speed": 3000,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
         "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2,
-        "zero_kill_ratio": 50,
+        "exclusion_ratio": 2, "zero_kill_ratio": 50,
+        "unit_speed": 30, "instrumented_speed": 2000,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
         "test_efficiency": 0.9, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2,
-        "zero_kill_ratio": 40,
+        "exclusion_ratio": 2, "zero_kill_ratio": 30,
+        "unit_speed": 15, "instrumented_speed": 1000,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
         "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 1,
-        "zero_kill_ratio": 0,
+        "exclusion_ratio": 1, "zero_kill_ratio": 0,
+        "unit_speed": 10, "instrumented_speed": 500,
     }),
 ]
 
@@ -378,10 +381,10 @@ for idx, (tier_name, reqs) in enumerate(tiers):
         failures.append(f"zero-kill ratio {zero_kill_ratio:.1f}% > {reqs['zero_kill_ratio']}%")
 
     # Speed check (skip if not measured)
-    if tier_name in speed_tiers and avg_test_ms is not None:
-        if avg_test_ms > speed_tiers[tier_name]:
+    if "unit_speed" in reqs and avg_test_ms is not None:
+        if avg_test_ms > reqs["unit_speed"]:
             met = False
-            failures.append(f"unit test speed {avg_test_ms:.1f}ms > {speed_tiers[tier_name]}ms")
+            failures.append(f"unit test speed {avg_test_ms:.1f}ms > {reqs['unit_speed']}ms")
 
     if met:
         highest_tier_idx = idx
