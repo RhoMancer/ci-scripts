@@ -62,6 +62,7 @@ import xml.etree.ElementTree as ET
 import sys
 import os
 import glob
+import subprocess
 
 jacoco_path = sys.argv[1]
 pit_path = sys.argv[2]
@@ -186,7 +187,67 @@ test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STR
 has_strategy = os.path.exists('TEST_STRATEGY.md')
 
 # ============ Exclusion ratio ============
-exclusion_ratio_str = "N/A"
+# Compare included classes (in JaCoCo XML) vs all compiled .class files.
+# Classes on disk but not in JaCoCo XML are excluded.
+# Count their bytecode instructions using javap.
+included_classes = set()
+for pkg in jacoco_root.findall('package'):
+    for cls in pkg.findall('class'):
+        name = cls.get('name', '')  # e.g. com/angussoftware/gradletools/Foo
+        if name:
+            included_classes.add(name)
+
+# Find compiled .class directory
+class_dirs = [
+    'gradle-tools/build/classes/kotlin/main',
+    'build/classes/kotlin/main',
+    'build/classes/java/main',
+]
+excluded_instr_count = 0
+excluded_class_names = []
+
+for class_dir in class_dirs:
+    if not os.path.isdir(class_dir):
+        continue
+    for root_dir, dirs, files in os.walk(class_dir):
+        for f in files:
+            if not f.endswith('.class'):
+                continue
+            full_path = os.path.join(root_dir, f)
+            # Get class name relative to class_dir
+            rel_path = os.path.relpath(full_path, class_dir)
+            # Normalize: com/angussoftware/.../Foo.class -> com/angussoftware/.../Foo
+            cls_name = rel_path.replace('.class', '').replace(os.sep, '/')
+            # Check inner classes: Foo$Bar -> parent is Foo
+            cls_base = cls_name.split('$')[0]
+            # Is this class (or its parent) in JaCoCo?
+            if cls_name in included_classes or cls_base in included_classes:
+                continue
+            # Also check if any JaCoCo class starts with this prefix
+            found = any(
+                inc == cls_name or inc.startswith(cls_name + '$') or cls_name.startswith(inc + '$')
+                for inc in included_classes
+            )
+            if found:
+                continue
+            # This class is excluded — count its instructions via javap
+            try:
+                result = subprocess.run(
+                    ['javap', '-c', full_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                # Count lines that look like bytecode instructions
+                instr_count = sum(1 for line in result.stdout.split('\n')
+                                  if line.strip() and ':' in line and not line.strip().startswith('//'))
+                excluded_instr_count += instr_count
+                excluded_class_names.append(cls_name.split('/')[-1])
+            except:
+                pass
+    break  # only process first matching class_dir
+
+included_instr = instruction_covered + instruction_missed
+total_instr = included_instr + excluded_instr_count
+exclusion_ratio_pct = excluded_instr_count * 100 / total_instr if total_instr > 0 else 0
 
 # ============ Print Results ============
 print("=" * 60)
@@ -206,7 +267,7 @@ else:
 print(f"  Test Efficiency:  {test_efficiency:.3f}  [K/T = kills per test]")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
-print(f"  Exclusion ratio:  {exclusion_ratio_str}")
+print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
 if exclusion_mismatches:
     print(f"\n  FATAL: {len(exclusion_mismatches)} classes have JaCoCo branches but NO PIT mutations:")
     for cls in sorted(exclusion_mismatches)[:10]:
@@ -221,26 +282,29 @@ print()
 # ============ Determine Tier ============
 tiers = [
     ("Bronze", {
-        "instruction": 50, "branch": 40,
+        "instruction": 50, "branch": 40, "exclusion_ratio": 5,
     }),
     ("Silver", {
-        "instruction": 70, "branch": 60,
+        "instruction": 70, "branch": 60, "exclusion_ratio": 5,
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "test_efficiency": 0.3, "test_isolation": True,
+        "test_efficiency": 0.3, "test_isolation": True, "exclusion_ratio": 3,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
         "test_efficiency": 0.5, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
         "test_efficiency": 0.9, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
         "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 1,
     }),
 ]
 
@@ -278,6 +342,10 @@ for idx, (tier_name, reqs) in enumerate(tiers):
     if "has_strategy" in reqs and not has_strategy:
         met = False
         failures.append("no TEST_STRATEGY.md")
+
+    if "exclusion_ratio" in reqs and exclusion_ratio_pct > reqs["exclusion_ratio"]:
+        met = False
+        failures.append(f"exclusion ratio {exclusion_ratio_pct:.1f}% > {reqs['exclusion_ratio']}%")
 
     # Speed check (skip if not measured)
     if tier_name in speed_tiers and avg_test_ms is not None:
