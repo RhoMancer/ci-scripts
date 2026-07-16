@@ -102,6 +102,9 @@ killed_mutations = 0
 survived_mutations = 0
 no_coverage_mutations = 0
 
+# Track which classes PIT generated mutations for
+pit_classes = set()
+
 for m in pit_root.findall('.//mutation'):
     status = m.get('status', '')
     total_mutations += 1
@@ -111,8 +114,36 @@ for m in pit_root.findall('.//mutation'):
         survived_mutations += 1
     elif status == 'NO_COVERAGE':
         no_coverage_mutations += 1
+    cls = m.find('mutatedClass')
+    if cls is not None and cls.text:
+        pit_classes.add(cls.text)
 
 mutation_pct = killed_mutations * 100 / total_mutations if total_mutations > 0 else 0
+
+# ============ Exclusion consistency check ============
+# Classes in JaCoCo but NOT in PIT are excluded from mutation testing
+# but still measured for coverage. This creates inconsistent metrics.
+jacoco_classes = set()
+for pkg in jacoco_root.findall('package'):
+    for cls in pkg.findall('class'):
+        cls_name = cls.get('name', '')
+        if cls_name:
+            jacoco_classes.add(cls_name)
+
+# Find classes in JaCoCo but not in PIT
+exclusion_mismatches = []
+for cls in jacoco_classes:
+    # Check if any PIT class matches this JaCoCo class
+    # JaCoCo uses slashes, PIT uses dots — normalize
+    cls_normalized = cls.replace('/', '.')
+    found = False
+    for pit_cls in pit_classes:
+        if pit_cls.startswith(cls_normalized) or cls_normalized.startswith(pit_cls):
+            found = True
+            break
+    if not found:
+        short_name = cls.split('/')[-1]
+        exclusion_mismatches.append(short_name)
 
 # ============ Parse JUnit (test count + time) ============
 test_count = 0
@@ -167,6 +198,13 @@ print(f"  Test Efficiency:  {test_efficiency:.3f}  [K/T = kills per test]")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_str}")
+if exclusion_mismatches:
+    print(f"  Exclusion mismatches: {len(exclusion_mismatches)} classes in JaCoCo but NOT in PIT:")
+    for cls in sorted(exclusion_mismatches)[:10]:
+        print(f"    ! {cls}")
+    if len(exclusion_mismatches) > 10:
+        print(f"    ... and {len(exclusion_mismatches) - 10} more")
+    print(f"  (These classes have coverage but no mutations — exclude from JaCoCo too)")
 print()
 
 # ============ Determine Tier ============
