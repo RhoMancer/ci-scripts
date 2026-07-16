@@ -106,6 +106,9 @@ no_coverage_mutations = 0
 # Track which classes PIT generated mutations for
 pit_classes = set()
 
+# Track which tests killed mutations (for zero-kill ratio)
+killing_test_names = set()
+
 for m in pit_root.findall('.//mutation'):
     status = m.get('status', '')
     total_mutations += 1
@@ -118,6 +121,9 @@ for m in pit_root.findall('.//mutation'):
     cls = m.find('mutatedClass')
     if cls is not None and cls.text:
         pit_classes.add(cls.text)
+    kt = m.find('killingTest')
+    if kt is not None and kt.text:
+        killing_test_names.add(kt.text.strip())
 
 mutation_pct = killed_mutations * 100 / total_mutations if total_mutations > 0 else 0
 
@@ -179,11 +185,20 @@ avg_test_ms = test_time_ms / test_count if test_count > 0 else None
 
 # ============ Test Efficiency Score ============
 # Formula: killed_mutations / test_count (kills per test)
-# Higher = better. Each test should kill >1 mutation on average.
+# Target = 1.0 (one test per mutation point = perfect correspondence)
 if test_count > 0:
     test_efficiency = killed_mutations / test_count
 else:
     test_efficiency = 0
+
+# ============ Zero-Kill Test Ratio ============
+# % of tests that are not reported as killing any mutation by PIT
+# Target = 0% (every test kills at least 1 mutation)
+# Note: PIT reports ONE killing test per mutation, so this is a lower bound
+# on the true zero-kill count (some tests may kill mutations PIT attributed
+# to other tests)
+zero_kill_count = test_count - len(killing_test_names) if test_count > 0 else 0
+zero_kill_ratio = zero_kill_count * 100 / test_count if test_count > 0 else 0
 
 # ============ Test isolation ============
 test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
@@ -269,7 +284,8 @@ if avg_test_ms is not None:
     print(f"  Avg test speed:   {avg_test_ms:.1f}ms/test")
 else:
     print(f"  Avg test speed:   N/A")
-print(f"  Test Efficiency:  {test_efficiency:.3f}  [K/T = kills per test]")
+print(f"  Test Efficiency:  {test_efficiency:.3f}  [K/T = kills per test, target=1.0]")
+print(f"  Zero-Kill Ratio:  {zero_kill_ratio:.1f}% ({zero_kill_count}/{test_count} tests kill 0 mutations)")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
@@ -287,28 +303,34 @@ print()
 tiers = [
     ("Bronze", {
         "instruction": 50, "branch": 40, "exclusion_ratio": 5,
+        "zero_kill_ratio": 80,
     }),
     ("Silver", {
         "instruction": 70, "branch": 60, "exclusion_ratio": 5,
+        "zero_kill_ratio": 70,
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "test_efficiency": 0.3, "test_isolation": True, "exclusion_ratio": 5,
+        "test_efficiency": 0.5, "test_isolation": True, "exclusion_ratio": 5,
+        "zero_kill_ratio": 60,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
-        "test_efficiency": 0.5, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 2,
+        "zero_kill_ratio": 50,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
         "test_efficiency": 0.9, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 2,
+        "zero_kill_ratio": 40,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
         "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 1,
+        "zero_kill_ratio": 30,
     }),
 ]
 
@@ -350,6 +372,10 @@ for idx, (tier_name, reqs) in enumerate(tiers):
     if "exclusion_ratio" in reqs and exclusion_ratio_pct > reqs["exclusion_ratio"]:
         met = False
         failures.append(f"exclusion ratio {exclusion_ratio_pct:.1f}% > {reqs['exclusion_ratio']}%")
+
+    if "zero_kill_ratio" in reqs and zero_kill_ratio > reqs["zero_kill_ratio"]:
+        met = False
+        failures.append(f"zero-kill ratio {zero_kill_ratio:.1f}% > {reqs['zero_kill_ratio']}%")
 
     # Speed check (skip if not measured)
     if tier_name in speed_tiers and avg_test_ms is not None:
