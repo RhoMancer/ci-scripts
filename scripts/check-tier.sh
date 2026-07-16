@@ -191,7 +191,7 @@ tiers = [
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
-        "test_efficiency": 0.85, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
     }),
 ]
 
