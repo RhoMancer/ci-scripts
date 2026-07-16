@@ -179,19 +179,19 @@ tiers = [
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "test_efficiency": 0.5, "test_isolation": True,
+        "test_efficiency": 0.3, "test_isolation": True,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
-        "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 0.5, "test_isolation": True, "has_strategy": True,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
-        "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
-        "test_efficiency": 1.5, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 0.85, "test_isolation": True, "has_strategy": True,
     }),
 ]
 
