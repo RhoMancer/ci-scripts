@@ -187,7 +187,7 @@ tiers = [
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
-        "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
+        "test_efficiency": 0.9, "test_isolation": True, "has_strategy": True,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
