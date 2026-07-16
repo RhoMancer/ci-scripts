@@ -121,29 +121,38 @@ for m in pit_root.findall('.//mutation'):
 mutation_pct = killed_mutations * 100 / total_mutations if total_mutations > 0 else 0
 
 # ============ Exclusion consistency check ============
-# Classes in JaCoCo but NOT in PIT are excluded from mutation testing
-# but still measured for coverage. This creates inconsistent metrics.
-jacoco_classes = set()
+# JaCoCo and PIT must exclude the same classes. If a class is in JaCoCo
+# but has NO mutations in PIT, it's either excluded from PIT (mismatch — FAIL)
+# or has no mutatable bytecode (OK — but only if it also has no branches,
+# since PIT's RemoveConditional mutator targets every branch).
+jacoco_classes = {}  # name -> has_branches
 for pkg in jacoco_root.findall('package'):
     for cls in pkg.findall('class'):
         cls_name = cls.get('name', '')
-        if cls_name:
-            jacoco_classes.add(cls_name)
+        if not cls_name:
+            continue
+        has_branches = False
+        for counter in cls.findall('counter'):
+            if counter.get('type') == 'BRANCH':
+                covered = int(counter.get('covered', 0))
+                missed = int(counter.get('missed', 0))
+                if covered + missed > 0:
+                    has_branches = True
+        jacoco_classes[cls_name] = has_branches
 
 # Find classes in JaCoCo but not in PIT
 exclusion_mismatches = []
-for cls in jacoco_classes:
-    # Check if any PIT class matches this JaCoCo class
-    # JaCoCo uses slashes, PIT uses dots — normalize
-    cls_normalized = cls.replace('/', '.')
-    found = False
-    for pit_cls in pit_classes:
-        if pit_cls.startswith(cls_normalized) or cls_normalized.startswith(pit_cls):
-            found = True
-            break
+for cls_name, has_branches in jacoco_classes.items():
+    cls_normalized = cls_name.replace('/', '.')
+    found = any(
+        pit_cls.startswith(cls_normalized) or cls_normalized.startswith(pit_cls)
+        for pit_cls in pit_classes
+    )
     if not found:
-        short_name = cls.split('/')[-1]
-        exclusion_mismatches.append(short_name)
+        short_name = cls_name.split('/')[-1]
+        if has_branches:
+            # Has branches but no mutations = definitely excluded from PIT
+            exclusion_mismatches.append(short_name)
 
 # ============ Parse JUnit (test count + time) ============
 test_count = 0
@@ -199,12 +208,14 @@ print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_str}")
 if exclusion_mismatches:
-    print(f"  Exclusion mismatches: {len(exclusion_mismatches)} classes in JaCoCo but NOT in PIT:")
+    print(f"\n  FATAL: {len(exclusion_mismatches)} classes have JaCoCo branches but NO PIT mutations:")
     for cls in sorted(exclusion_mismatches)[:10]:
         print(f"    ! {cls}")
     if len(exclusion_mismatches) > 10:
         print(f"    ... and {len(exclusion_mismatches) - 10} more")
-    print(f"  (These classes have coverage but no mutations — exclude from JaCoCo too)")
+    print(f"\n  These classes are excluded from PIT but not JaCoCo.")
+    print(f"  Exclusion lists MUST be identical. Add to JaCoCo excludes or remove from PIT excludes.")
+    sys.exit(2)
 print()
 
 # ============ Determine Tier ============
