@@ -326,7 +326,8 @@ if avg_test_ms is not None:
     print(f"  Avg test speed:   {avg_test_ms:.1f}ms/test")
 else:
     print(f"  Avg test speed:   N/A")
-print(f"  Test Quality Score: {test_quality_score:.3f}  [TES={tes:.3f} × Gaussian(K/T={non_bloat_kt:.2f})={kt_factor:.3f}]")
+print(f"  TES:              {tes:.3f}  [1 - ({total_bloat}/{test_count}) bloat]")
+print(f"  Gaussian K/T:     {kt_factor:.3f}  [non-bloat K/T={non_bloat_kt:.2f}, target=3-5]")
 print(f"    Zero-kill: {zero_kill_count}, Subset bloat: {len(bloat_tests)}, Non-bloat: {non_bloat_count}/{test_count}")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
@@ -345,32 +346,32 @@ print()
 tiers = [
     ("Bronze", {
         "instruction": 50, "branch": 40, "mutation": 20,
-        "test_quality": 0.10, "exclusion_ratio": 5,
+        "tes": 0.10, "gaussian_kt": 0.10, "exclusion_ratio": 5,
         "unit_speed": 200, "instrumented_speed": 10000,
     }),
     ("Silver", {
         "instruction": 70, "branch": 60, "mutation": 35,
-        "test_quality": 0.20, "exclusion_ratio": 5,
+        "tes": 0.20, "gaussian_kt": 0.20, "exclusion_ratio": 5,
         "unit_speed": 100, "instrumented_speed": 5000,
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "test_quality": 0.30, "test_isolation": True, "has_strategy": True,
+        "tes": 0.30, "gaussian_kt": 0.35, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 3, "unit_speed": 50, "instrumented_speed": 3000,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
-        "test_quality": 0.50, "test_isolation": True, "has_strategy": True,
+        "tes": 0.50, "gaussian_kt": 0.50, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 2, "unit_speed": 30, "instrumented_speed": 2000,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
-        "test_quality": 0.70, "test_isolation": True, "has_strategy": True,
+        "tes": 0.70, "gaussian_kt": 0.65, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 2, "unit_speed": 15, "instrumented_speed": 1000,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
-        "test_quality": 1.00, "test_isolation": True, "has_strategy": True,
+        "tes": 1.00, "gaussian_kt": 0.80, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 1, "unit_speed": 10, "instrumented_speed": 500,
     }),
 ]
@@ -398,9 +399,13 @@ for idx, (tier_name, reqs) in enumerate(tiers):
         met = False
         failures.append(f"mutation {mutation_pct:.1f}% < {reqs['mutation']}%")
 
-    if "test_quality" in reqs and test_quality_score < reqs["test_quality"]:
+    if "tes" in reqs and tes < reqs["tes"]:
         met = False
-        failures.append(f"test quality {test_quality_score:.3f} < {reqs['test_quality']}")
+        failures.append(f"TES {tes:.3f} < {reqs['tes']}")
+
+    if "gaussian_kt" in reqs and kt_factor < reqs["gaussian_kt"]:
+        met = False
+        failures.append(f"gaussian K/T {kt_factor:.3f} < {reqs['gaussian_kt']}")
 
     if "test_isolation" in reqs and not test_isolation:
         met = False
