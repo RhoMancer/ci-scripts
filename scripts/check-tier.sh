@@ -94,7 +94,7 @@ instruction_pct = instruction_covered * 100 / instruction_total if instruction_t
 branch_total = branch_missed + branch_covered
 branch_pct = branch_covered * 100 / branch_total if branch_total > 0 else 0
 
-# ============ Parse PIT ============
+# ============ Parse PIT (with full mutation matrix) ============
 pit_tree = ET.parse(pit_path)
 pit_root = pit_tree.getroot()
 
@@ -103,11 +103,9 @@ killed_mutations = 0
 survived_mutations = 0
 no_coverage_mutations = 0
 
-# Track which classes PIT generated mutations for
 pit_classes = set()
-
-# Track which tests killed mutations (for zero-kill ratio)
-killing_test_names = set()
+# Full kill matrix: test_name -> set of mutation IDs it kills
+test_kill_matrix = {}  # method_name -> set of mutation_ids
 
 for m in pit_root.findall('.//mutation'):
     status = m.get('status', '')
@@ -121,11 +119,37 @@ for m in pit_root.findall('.//mutation'):
     cls = m.find('mutatedClass')
     if cls is not None and cls.text:
         pit_classes.add(cls.text)
-    kt = m.find('killingTest')
-    if kt is not None and kt.text:
-        killing_test_names.add(kt.text.strip())
+    
+    # Build mutation ID
+    src = m.find('sourceFile')
+    line = m.find('lineNumber')
+    mutator = m.find('mutator')
+    mut_id = f"{src.text if src is not None else '?'}:{line.text if line is not None else '?'}:{mutator.text.split('.')[-1] if mutator is not None else '?'}"
+    
+    # Parse killingTests (fullMutationMatrix format) or killingTest (legacy)
+    kt_elem = m.find('killingTests')
+    if kt_elem is not None and kt_elem.text:
+        # Full matrix: pipe-separated test names
+        for test_full in kt_elem.text.split('|'):
+            if '[method:' in test_full:
+                method = test_full.split('[method:')[1].split('()]')[0]
+                if method not in test_kill_matrix:
+                    test_kill_matrix[method] = set()
+                test_kill_matrix[method].add(mut_id)
+    else:
+        kt_elem = m.find('killingTest')
+        if kt_elem is not None and kt_elem.text:
+            text = kt_elem.text.strip()
+            if '[method:' in text:
+                method = text.split('[method:')[1].split('()]')[0]
+                if method not in test_kill_matrix:
+                    test_kill_matrix[method] = set()
+                test_kill_matrix[method].add(mut_id)
 
 mutation_pct = killed_mutations * 100 / total_mutations if total_mutations > 0 else 0
+
+# For exclusion consistency check
+killing_test_names = set(test_kill_matrix.keys())
 
 # ============ Exclusion consistency check ============
 # JaCoCo and PIT must exclude the same classes. If a class is in JaCoCo
@@ -183,22 +207,40 @@ if junit_dir and os.path.isdir(junit_dir):
 test_time_ms = test_time_seconds * 1000
 avg_test_ms = test_time_ms / test_count if test_count > 0 else None
 
-# ============ Test Efficiency Score ============
-# Formula: killed_mutations / test_count (kills per test)
-# Target = 1.0 (one test per mutation point = perfect correspondence)
-if test_count > 0:
-    test_efficiency = killed_mutations / test_count
-else:
-    test_efficiency = 0
+# ============ Test Quality Score (unified formula) ============
+# Score = TES × Gaussian(non_bloat_K/T, center=4.0, sigma=1.5)
+# Where:
+#   TES = 1 - (zero_kill + subset_bloat) / total_tests
+#   zero_kill = tests with 0 mutations killed
+#   subset_bloat = tests whose kills are a subset of another test's kills
+#   non_bloat_K/T = killed_mutations / non_bloat_tests
+#   Gaussian penalizes both underutilization (K/T too low) and mega-tests (K/T too high)
+import math
 
-# ============ Zero-Kill Test Ratio ============
-# % of tests that are not reported as killing any mutation by PIT
-# Target = 0% (every test kills at least 1 mutation)
-# Note: PIT reports ONE killing test per mutation, so this is a lower bound
-# on the true zero-kill count (some tests may kill mutations PIT attributed
-# to other tests)
-zero_kill_count = test_count - len(killing_test_names) if test_count > 0 else 0
-zero_kill_ratio = zero_kill_count * 100 / test_count if test_count > 0 else 0
+zero_kill_count = test_count - len(test_kill_matrix) if test_count > 0 else 0
+
+# Find subset bloat
+test_names = list(test_kill_matrix.keys())
+bloat_tests = set()
+for i, test_a in enumerate(test_names):
+    kills_a = test_kill_matrix[test_a]
+    for j, test_b in enumerate(test_names):
+        if i == j:
+            continue
+        kills_b = test_kill_matrix[test_b]
+        if kills_a < kills_b:
+            bloat_tests.add(test_a)
+            break
+        elif kills_a == kills_b and i < j:
+            bloat_tests.add(test_a)
+            break
+
+total_bloat = zero_kill_count + len(bloat_tests)
+non_bloat_count = test_count - total_bloat
+tes = 1 - total_bloat / test_count if test_count > 0 else 0
+non_bloat_kt = killed_mutations / non_bloat_count if non_bloat_count > 0 else 0
+kt_factor = math.exp(-((non_bloat_kt - 4.0)**2) / (2 * 1.5**2))
+test_quality_score = tes * kt_factor
 
 # ============ Test isolation ============
 test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
@@ -284,8 +326,8 @@ if avg_test_ms is not None:
     print(f"  Avg test speed:   {avg_test_ms:.1f}ms/test")
 else:
     print(f"  Avg test speed:   N/A")
-print(f"  Test Efficiency:  {test_efficiency:.3f}  [K/T = kills per test, target=1.0]")
-print(f"  Zero-Kill Ratio:  {zero_kill_ratio:.1f}% ({zero_kill_count}/{test_count} tests kill 0 mutations)")
+print(f"  Test Quality Score: {test_quality_score:.3f}  [TES={tes:.3f} × Gaussian(K/T={non_bloat_kt:.2f})={kt_factor:.3f}]")
+print(f"    Zero-kill: {zero_kill_count}, Subset bloat: {len(bloat_tests)}, Non-bloat: {non_bloat_count}/{test_count}")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
@@ -303,37 +345,33 @@ print()
 tiers = [
     ("Bronze", {
         "instruction": 50, "branch": 40, "mutation": 20,
-        "test_efficiency": 0.1, "exclusion_ratio": 5,
-        "zero_kill_ratio": 85, "unit_speed": 200, "instrumented_speed": 10000,
+        "test_quality": 0.10, "exclusion_ratio": 5,
+        "unit_speed": 200, "instrumented_speed": 10000,
     }),
     ("Silver", {
         "instruction": 70, "branch": 60, "mutation": 35,
-        "test_efficiency": 0.2, "exclusion_ratio": 5,
-        "zero_kill_ratio": 75, "unit_speed": 100, "instrumented_speed": 5000,
+        "test_quality": 0.20, "exclusion_ratio": 5,
+        "unit_speed": 100, "instrumented_speed": 5000,
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "test_efficiency": 0.5, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 3, "zero_kill_ratio": 65,
-        "unit_speed": 50, "instrumented_speed": 3000,
+        "test_quality": 0.30, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 3, "unit_speed": 50, "instrumented_speed": 3000,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
-        "test_efficiency": 0.7, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2, "zero_kill_ratio": 50,
-        "unit_speed": 30, "instrumented_speed": 2000,
+        "test_quality": 0.50, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2, "unit_speed": 30, "instrumented_speed": 2000,
     }),
     ("Diamond", {
         "instruction": 98, "branch": 95, "mutation": 95,
-        "test_efficiency": 0.9, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2, "zero_kill_ratio": 30,
-        "unit_speed": 15, "instrumented_speed": 1000,
+        "test_quality": 0.70, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2, "unit_speed": 15, "instrumented_speed": 1000,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
-        "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 1, "zero_kill_ratio": 0,
-        "unit_speed": 10, "instrumented_speed": 500,
+        "test_quality": 1.00, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 1, "unit_speed": 10, "instrumented_speed": 500,
     }),
 ]
 
@@ -360,9 +398,9 @@ for idx, (tier_name, reqs) in enumerate(tiers):
         met = False
         failures.append(f"mutation {mutation_pct:.1f}% < {reqs['mutation']}%")
 
-    if "test_efficiency" in reqs and test_efficiency < reqs["test_efficiency"]:
+    if "test_quality" in reqs and test_quality_score < reqs["test_quality"]:
         met = False
-        failures.append(f"test efficiency {test_efficiency:.3f} < {reqs['test_efficiency']}")
+        failures.append(f"test quality {test_quality_score:.3f} < {reqs['test_quality']}")
 
     if "test_isolation" in reqs and not test_isolation:
         met = False
@@ -375,10 +413,6 @@ for idx, (tier_name, reqs) in enumerate(tiers):
     if "exclusion_ratio" in reqs and exclusion_ratio_pct > reqs["exclusion_ratio"]:
         met = False
         failures.append(f"exclusion ratio {exclusion_ratio_pct:.1f}% > {reqs['exclusion_ratio']}%")
-
-    if "zero_kill_ratio" in reqs and zero_kill_ratio > reqs["zero_kill_ratio"]:
-        met = False
-        failures.append(f"zero-kill ratio {zero_kill_ratio:.1f}% > {reqs['zero_kill_ratio']}%")
 
     # Speed check (skip if not measured)
     if "unit_speed" in reqs and avg_test_ms is not None:
