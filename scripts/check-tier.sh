@@ -330,7 +330,7 @@ tiers = [
         "instruction": 100, "branch": 100, "mutation": 100,
         "test_efficiency": 1.0, "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 1,
-        "zero_kill_ratio": 30,
+        "zero_kill_ratio": 0,
     }),
 ]
 
