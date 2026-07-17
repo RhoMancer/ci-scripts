@@ -242,11 +242,21 @@ tes = 1 - total_bloat / test_count if test_count > 0 else 0
 # Compute K/T using ALL tests (including bloat)
 # Bloat tests kill 0 mutations, dragging the mean down (correct behavior)
 # Mega-tests kill many, pushing the mean up (correct behavior)
-# The Gaussian sees both problems simultaneously
 all_total_kills = sum(len(kills) for kills in test_kill_matrix.values())
 kt_mean = all_total_kills / test_count if test_count > 0 else 0
-kt_factor = math.exp(-((kt_mean - 4.0)**2) / (2 * 1.5**2))
-kt_factor = math.exp(-((kt_mean - 4.0)**2) / (2 * 1.5**2))
+
+# Accuracy: how close is mean to the 4.0 sweet spot?
+kt_accuracy = math.exp(-((kt_mean - 4.0)**2) / (2 * 1.5**2))
+
+# Precision: how evenly distributed are kills across tests?
+# Penalizes variance: mega-tests (38 kills) or bloat (0 kills) both lower this.
+# k=20 calibrated against real-world scenarios.
+per_test_kills_list = [len(v) for v in test_kill_matrix.values()] + [0] * (test_count - len(test_kill_matrix))
+kt_variance = sum((x - kt_mean)**2 for x in per_test_kills_list) / test_count if test_count > 0 else 0
+kt_precision = math.exp(-kt_variance / 20.0)
+
+# Combined: accuracy × precision. Score=1.0 only when every test kills exactly 4.
+kt_factor = kt_accuracy * kt_precision
 
 # ============ Test isolation ============
 test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
@@ -333,7 +343,7 @@ if avg_test_ms is not None:
 else:
     print(f"  Avg test speed:   N/A")
 print(f"  TES:              {tes:.3f}  [1 - ({total_bloat}/{test_count}) bloat]")
-print(f"  Gaussian K/T:     {kt_factor:.3f}  [K/T={kt_mean:.2f}, target=3-5]")
+print(f"  Gaussian K/T:     {kt_factor:.3f}  [acc={kt_accuracy:.3f} × prec={kt_precision:.3f}, K/T={kt_mean:.2f} var={kt_variance:.1f}]")
 print(f"    Zero-kill: {zero_kill_count}, Subset bloat: {len(bloat_tests)}, Non-bloat: {non_bloat_count}/{test_count}")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
