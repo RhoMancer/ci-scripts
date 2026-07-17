@@ -1,9 +1,10 @@
 #!/bin/sh
 # check-tier.sh — Determine a repo's testing tier from JaCoCo + PIT + JUnit XML reports.
-# Usage: check-tier.sh [--floor <tier>] <jacoco-xml> <pit-xml> [junit-xml-dir]
+# Usage: check-tier.sh [--floor <tier>] [--integration-junit-dir <dir>] <jacoco-xml> <pit-xml> [junit-xml-dir]
 #
-# --floor <tier> : Minimum tier required (default: Gold). Build fails if below.
-#                  Valid: Bronze, Silver, Gold, Platinum, Diamond, Perfection
+# --floor <tier>              : Minimum tier required (default: Gold). Build fails if below.
+#                               Valid: Bronze, Silver, Gold, Platinum, Diamond, Perfection
+# --integration-junit-dir <dir>: JUnit XML dir for integration tests (separate timing)
 #
 # Outputs: tier name + per-metric breakdown.
 # Exit code: 0 if tier >= floor, 1 if below floor, 2 if reports missing.
@@ -14,6 +15,7 @@
 JACOCO_XML=""
 PIT_XML=""
 JUNIT_DIR=""
+INTEGRATION_JUNIT_DIR=""
 FLOOR_TIER="Gold"
 
 # Parse arguments
@@ -21,6 +23,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --floor)
             FLOOR_TIER="$2"
+            shift 2
+            ;;
+        --integration-junit-dir)
+            INTEGRATION_JUNIT_DIR="$2"
             shift 2
             ;;
         *)
@@ -57,7 +63,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 2
 fi
 
-python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" << 'PYEOF'
+python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" << 'PYEOF'
 import xml.etree.ElementTree as ET
 import sys
 import os
@@ -68,6 +74,7 @@ jacoco_path = sys.argv[1]
 pit_path = sys.argv[2]
 junit_dir = sys.argv[3] if len(sys.argv) > 3 else ""
 floor_tier = sys.argv[4] if len(sys.argv) > 4 else "Gold"
+integration_junit_dir = sys.argv[5] if len(sys.argv) > 5 else ""
 
 # ============ Parse JaCoCo ============
 jacoco_tree = ET.parse(jacoco_path)
@@ -191,6 +198,7 @@ for cls_name, has_branches in jacoco_classes.items():
         no_mutation_classes.append(short_name)
 
 # ============ Parse JUnit (test count + time) ============
+# Unit tests (used for tier speed metric)
 test_count = 0
 test_time_seconds = 0.0
 
@@ -207,6 +215,22 @@ if junit_dir and os.path.isdir(junit_dir):
 test_time_ms = test_time_seconds * 1000
 avg_test_ms = test_time_ms / test_count if test_count > 0 else None
 
+# Integration tests (separate timing, not counted in unit speed tier metric)
+integration_test_count = 0
+integration_test_time_seconds = 0.0
+
+if integration_junit_dir and os.path.isdir(integration_junit_dir):
+    for xml_file in glob.glob(os.path.join(integration_junit_dir, '*.xml')):
+        try:
+            tree = ET.parse(xml_file)
+            suite = tree.getroot()
+            integration_test_count += int(suite.get('tests', 0))
+            integration_test_time_seconds += float(suite.get('time', 0))
+        except:
+            pass
+
+integration_avg_test_ms = (integration_test_time_seconds * 1000 / integration_test_count) if integration_test_count > 0 else None
+
 # ============ Test Quality Score (unified formula) ============
 # Score = TES × Gaussian(non_bloat_K/T, center=4.0, sigma=1.5)
 # Where:
@@ -217,7 +241,9 @@ avg_test_ms = test_time_ms / test_count if test_count > 0 else None
 #   Gaussian penalizes both underutilization (K/T too low) and mega-tests (K/T too high)
 import math
 
-zero_kill_count = test_count - len(test_kill_matrix) if test_count > 0 else 0
+# TES uses total test count (unit + integration) since PIT runs against both
+total_test_count_for_tes = test_count + integration_test_count
+zero_kill_count = total_test_count_for_tes - len(test_kill_matrix) if total_test_count_for_tes > 0 else 0
 
 # Find subset bloat
 test_names = list(test_kill_matrix.keys())
@@ -337,14 +363,20 @@ print(f"  Branch:           {branch_covered}/{branch_total} = {branch_pct:.1f}%"
 print(f"  Mutation:         {killed_mutations}/{total_mutations} = {mutation_pct:.1f}%")
 print(f"  Survived:         {survived_mutations}")
 print(f"  No coverage:      {no_coverage_mutations}")
-print(f"  Test count:       {test_count}")
+print(f"  Test count:       {test_count} (unit)")
+if integration_test_count > 0:
+    print(f"  Integration:      {integration_test_count} tests")
 if avg_test_ms is not None:
-    print(f"  Avg test speed:   {avg_test_ms:.1f}ms/test")
+    print(f"  Unit test speed:  {avg_test_ms:.1f}ms/test")
 else:
-    print(f"  Avg test speed:   N/A")
-print(f"  TES:              {tes:.3f}  [1 - ({total_bloat}/{test_count}) bloat]")
+    print(f"  Unit test speed:  N/A")
+if integration_avg_test_ms is not None:
+    print(f"  Integ test speed: {integration_avg_test_ms:.1f}ms/test")
+else:
+    print(f"  Integ test speed: N/A")
+print(f"  TES:              {tes:.3f}  [1 - ({total_bloat}/{total_test_count_for_tes}) bloat]")
 print(f"  K/T (info):       {kt_mean:.2f} kills/test, var={kt_variance:.1f} [diagnostic only]")
-print(f"    Zero-kill: {zero_kill_count}, Subset bloat: {len(bloat_tests)}, Non-bloat: {non_bloat_count}/{test_count}")
+print(f"    Zero-kill: {zero_kill_count}, Subset bloat: {len(bloat_tests)}, Non-bloat: {non_bloat_count}/{total_test_count_for_tes}")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
