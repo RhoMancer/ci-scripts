@@ -238,9 +238,12 @@ for i, test_a in enumerate(test_names):
 total_bloat = zero_kill_count + len(bloat_tests)
 non_bloat_count = test_count - total_bloat
 tes = 1 - total_bloat / test_count if test_count > 0 else 0
-non_bloat_kt = killed_mutations / non_bloat_count if non_bloat_count > 0 else 0
+
+# Compute non_bloat_K/T as MEAN kills per non-bloat test (from kill matrix)
+non_bloat_test_names = [t for t in test_names if t not in bloat_tests]
+non_bloat_total_kills = sum(len(test_kill_matrix[t]) for t in non_bloat_test_names)
+non_bloat_kt = non_bloat_total_kills / non_bloat_count if non_bloat_count > 0 else 0
 kt_factor = math.exp(-((non_bloat_kt - 4.0)**2) / (2 * 1.5**2))
-test_quality_score = tes * kt_factor
 
 # ============ Test isolation ============
 test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
@@ -345,34 +348,34 @@ print()
 # ============ Determine Tier ============
 tiers = [
     ("Bronze", {
-        "instruction": 50, "branch": 40, "mutation": 20,
-        "tes": 0.10, "gaussian_kt": 0.10, "exclusion_ratio": 5,
-        "unit_speed": 200, "instrumented_speed": 10000,
+        "instruction": 24, "branch": 24, "mutation": 24,
+        "tes": 0.24, "gaussian_kt": 0.19, "exclusion_ratio": 7.8,
+        "unit_speed": 383, "instrumented_speed": 22941,
     }),
     ("Silver", {
-        "instruction": 70, "branch": 60, "mutation": 35,
-        "tes": 0.20, "gaussian_kt": 0.20, "exclusion_ratio": 5,
-        "unit_speed": 100, "instrumented_speed": 5000,
+        "instruction": 46, "branch": 46, "mutation": 46,
+        "tes": 0.46, "gaussian_kt": 0.37, "exclusion_ratio": 5.9,
+        "unit_speed": 277, "instrumented_speed": 16558,
     }),
     ("Gold", {
-        "instruction": 85, "branch": 75, "mutation": 50,
-        "tes": 0.30, "gaussian_kt": 0.35, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 3, "unit_speed": 50, "instrumented_speed": 3000,
+        "instruction": 65, "branch": 65, "mutation": 65,
+        "tes": 0.65, "gaussian_kt": 0.52, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 4.2, "unit_speed": 183, "instrumented_speed": 10930,
     }),
     ("Platinum", {
-        "instruction": 95, "branch": 90, "mutation": 80,
-        "tes": 0.50, "gaussian_kt": 0.50, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2, "unit_speed": 30, "instrumented_speed": 2000,
+        "instruction": 81, "branch": 81, "mutation": 81,
+        "tes": 0.81, "gaussian_kt": 0.65, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2.7, "unit_speed": 104, "instrumented_speed": 6177,
     }),
     ("Diamond", {
-        "instruction": 98, "branch": 95, "mutation": 95,
-        "tes": 0.70, "gaussian_kt": 0.65, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2, "unit_speed": 15, "instrumented_speed": 1000,
+        "instruction": 93, "branch": 93, "mutation": 93,
+        "tes": 0.93, "gaussian_kt": 0.75, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 1.6, "unit_speed": 43, "instrumented_speed": 2507,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
         "tes": 1.00, "gaussian_kt": 0.80, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 1, "unit_speed": 10, "instrumented_speed": 500,
+        "exclusion_ratio": 1.0, "unit_speed": 10, "instrumented_speed": 500,
     }),
 ]
 
