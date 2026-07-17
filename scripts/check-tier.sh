@@ -139,7 +139,9 @@ for m in pit_root.findall('.//mutation'):
         # Full matrix: pipe-separated test names
         for test_full in kt_elem.text.split('|'):
             if '[method:' in test_full:
-                method = test_full.split('[method:')[1].split('()]')[0]
+                # PIT format: [method:testName()] — extract testName() matching JUnit XML
+                raw = test_full.split('[method:')[1]
+                method = raw[:-1] if raw.endswith(']') else raw
                 if method not in test_kill_matrix:
                     test_kill_matrix[method] = set()
                 test_kill_matrix[method].add(mut_id)
@@ -148,7 +150,8 @@ for m in pit_root.findall('.//mutation'):
         if kt_elem is not None and kt_elem.text:
             text = kt_elem.text.strip()
             if '[method:' in text:
-                method = text.split('[method:')[1].split('()]')[0]
+                raw = text.split('[method:')[1]
+                method = raw[:-1] if raw.endswith(']') else raw
                 if method not in test_kill_matrix:
                     test_kill_matrix[method] = set()
                 test_kill_matrix[method].add(mut_id)
