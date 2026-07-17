@@ -99,7 +99,7 @@ for method in sorted(bloat):
     # Find files for both bloat method and superset method
     bloat_file = ''
     super_file = ''
-    for f in glob.glob('gradle-tools/src/test/kotlin/**/*.kt', recursive=True):
+    for f in glob.glob('gradle-tools/src/*/kotlin/**/*.kt', recursive=True):
         try:
             with open(f) as fh:
                 content = fh.read()
