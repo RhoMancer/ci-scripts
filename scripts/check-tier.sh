@@ -361,29 +361,29 @@ print()
 # ============ Determine Tier ============
 tiers = [
     ("Bronze", {
-        "instruction": 24, "branch": 24, "mutation": 24,
-        "tes": 0.24, "exclusion_ratio": 7.8,
-        "unit_speed": 383, "instrumented_speed": 22941,
+        "instruction": 50, "branch": 40, "mutation": 20,
+        "tes": 0.10, "exclusion_ratio": 5.0,
+        "unit_speed": 200, "instrumented_speed": 10000,
     }),
     ("Silver", {
-        "instruction": 46, "branch": 46, "mutation": 46,
-        "tes": 0.46, "exclusion_ratio": 5.9,
-        "unit_speed": 277, "instrumented_speed": 16558,
+        "instruction": 70, "branch": 60, "mutation": 35,
+        "tes": 0.20, "exclusion_ratio": 5.0,
+        "unit_speed": 100, "instrumented_speed": 5000,
     }),
     ("Gold", {
-        "instruction": 65, "branch": 65, "mutation": 65,
-        "tes": 0.65, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 4.2, "unit_speed": 183, "instrumented_speed": 10930,
+        "instruction": 85, "branch": 75, "mutation": 50,
+        "tes": 0.30, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 3.0, "unit_speed": 50, "instrumented_speed": 3000,
     }),
     ("Platinum", {
-        "instruction": 81, "branch": 81, "mutation": 81,
-        "tes": 0.81, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2.7, "unit_speed": 104, "instrumented_speed": 6177,
+        "instruction": 95, "branch": 90, "mutation": 80,
+        "tes": 0.50, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2.0, "unit_speed": 30, "instrumented_speed": 2000,
     }),
     ("Diamond", {
-        "instruction": 93, "branch": 93, "mutation": 93,
-        "tes": 0.93, "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 1.6, "unit_speed": 43, "instrumented_speed": 2507,
+        "instruction": 98, "branch": 95, "mutation": 95,
+        "tes": 0.70, "test_isolation": True, "has_strategy": True,
+        "exclusion_ratio": 2.0, "unit_speed": 15, "instrumented_speed": 1000,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
@@ -391,11 +391,6 @@ tiers = [
         "exclusion_ratio": 1.0, "unit_speed": 10, "instrumented_speed": 500,
     }),
 ]
-
-# Speed thresholds (ms per test)
-speed_tiers = {
-    "Gold": 100, "Platinum": 50, "Diamond": 30, "Perfection": 10,
-}
 
 highest_tier_idx = -1
 
