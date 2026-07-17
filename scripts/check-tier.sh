@@ -239,13 +239,14 @@ total_bloat = zero_kill_count + len(bloat_tests)
 non_bloat_count = test_count - total_bloat
 tes = 1 - total_bloat / test_count if test_count > 0 else 0
 
-# Compute non_bloat_K/T as total kill-test pairs / non-bloat count
-# This captures variance: mega-tests that kill many mutations (including shared ones)
-# inflate the mean, which the Gaussian correctly penalizes.
-non_bloat_test_names = [t for t in test_names if t not in bloat_tests]
-non_bloat_total_kills = sum(len(test_kill_matrix[t]) for t in non_bloat_test_names)
-non_bloat_kt = non_bloat_total_kills / non_bloat_count if non_bloat_count > 0 else 0
-kt_factor = math.exp(-((non_bloat_kt - 4.0)**2) / (2 * 1.5**2))
+# Compute K/T using ALL tests (including bloat)
+# Bloat tests kill 0 mutations, dragging the mean down (correct behavior)
+# Mega-tests kill many, pushing the mean up (correct behavior)
+# The Gaussian sees both problems simultaneously
+all_total_kills = sum(len(kills) for kills in test_kill_matrix.values())
+kt_mean = all_total_kills / test_count if test_count > 0 else 0
+kt_factor = math.exp(-((kt_mean - 4.0)**2) / (2 * 1.5**2))
+kt_factor = math.exp(-((kt_mean - 4.0)**2) / (2 * 1.5**2))
 
 # ============ Test isolation ============
 test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
@@ -332,7 +333,7 @@ if avg_test_ms is not None:
 else:
     print(f"  Avg test speed:   N/A")
 print(f"  TES:              {tes:.3f}  [1 - ({total_bloat}/{test_count}) bloat]")
-print(f"  Gaussian K/T:     {kt_factor:.3f}  [non-bloat K/T={non_bloat_kt:.2f}, target=3-5]")
+print(f"  Gaussian K/T:     {kt_factor:.3f}  [K/T={kt_mean:.2f}, target=3-5]")
 print(f"    Zero-kill: {zero_kill_count}, Subset bloat: {len(bloat_tests)}, Non-bloat: {non_bloat_count}/{test_count}")
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
