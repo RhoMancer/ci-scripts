@@ -239,13 +239,12 @@ total_bloat = zero_kill_count + len(bloat_tests)
 non_bloat_count = test_count - total_bloat
 tes = 1 - total_bloat / test_count if test_count > 0 else 0
 
-# Compute non_bloat_K/T as UNIQUE mutations killed by non-bloat tests / non-bloat count
-# Using unique kills (not total kill-test pairs) because shared kills would inflate the mean
+# Compute non_bloat_K/T as total kill-test pairs / non-bloat count
+# This captures variance: mega-tests that kill many mutations (including shared ones)
+# inflate the mean, which the Gaussian correctly penalizes.
 non_bloat_test_names = [t for t in test_names if t not in bloat_tests]
-non_bloat_unique_kills = set()
-for t in non_bloat_test_names:
-    non_bloat_unique_kills.update(test_kill_matrix[t])
-non_bloat_kt = len(non_bloat_unique_kills) / non_bloat_count if non_bloat_count > 0 else 0
+non_bloat_total_kills = sum(len(test_kill_matrix[t]) for t in non_bloat_test_names)
+non_bloat_kt = non_bloat_total_kills / non_bloat_count if non_bloat_count > 0 else 0
 kt_factor = math.exp(-((non_bloat_kt - 4.0)**2) / (2 * 1.5**2))
 
 # ============ Test isolation ============
