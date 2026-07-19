@@ -217,13 +217,104 @@ included_instr = instruction_covered + instruction_missed
 total_instr = included_instr + excluded_instr_count
 exclusion_ratio_pct = excluded_instr_count * 100 / total_instr if total_instr > 0 else 0
 
-# ============ M_p (Phase 2 — source analysis, optional) ============
+# ============ M_p (Phase 2 — source analysis for primary methods) ============
 max_mp = None
 mp_warning = ""
 if test_src_dir and os.path.isdir(test_src_dir):
-    # Phase 2: parse test source for direct production method calls
-    # This is a simplified implementation — full implementation needs call graph analysis
-    mp_warning = "  (M_p source analysis: Phase 2 — not yet implemented)"
+    # Collect all production method names from PIT data
+    prod_methods = set()
+    for mk in test_methods.values():
+        for method_key in mk:
+            # method_key is "ClassName::methodName" — extract method name
+            parts = method_key.split('::')
+            if len(parts) == 2:
+                prod_methods.add(parts[1])
+
+    # Also scan main source dir for additional production methods
+    main_src_dirs = ['src/main/kotlin', 'gradle-tools/src/main/kotlin']
+    for msd in main_src_dirs:
+        full_msd = os.path.join(os.getcwd(), msd) if not os.path.isabs(msd) else msd
+        if os.path.isdir(full_msd):
+            for root_d, _, files in os.walk(full_msd):
+                for f in files:
+                    if not f.endswith('.kt'): continue
+                    try:
+                        with open(os.path.join(root_d, f)) as fh:
+                            content = fh.read()
+                        # Find function definitions: fun methodName( or fun `methodName`(
+                        for match in re.finditer(r'fun\s+[`]?(\w+)[`]?\s*\(', content):
+                            prod_methods.add(match.group(1))
+                    except: pass
+
+    # Scan test source files to find what each test directly calls
+    test_method_calls = defaultdict(set)  # test_name -> set of production methods called
+
+    for root_d, _, files in os.walk(test_src_dir):
+        for f in files:
+            if not f.endswith('.kt'): continue
+            filepath = os.path.join(root_d, f)
+            try:
+                with open(filepath) as fh:
+                    lines = fh.readlines()
+            except:
+                continue
+
+            # Find @Test methods and their bodies
+            current_test = None
+            brace_depth = 0
+            test_body_lines = []
+
+            for i, line in enumerate(lines):
+                # Detect @Test annotation followed by fun declaration
+                if current_test is None:
+                    # Match: @Test on previous line, then fun declaration
+                    is_test_line = False
+                    if '@Test' in line:
+                        is_test_line = True
+                    elif i > 0 and '@Test' in lines[i-1].strip():
+                        is_test_line = True
+
+                    if is_test_line:
+                        # Match fun `test name with spaces`() or fun testName()
+                        test_match = re.search(r'fun\s+[`]?([^`]*(?:`[^`]*)?)[`]?\s*\(', line)
+                        if test_match:
+                            current_test = test_match.group(1).strip()
+                            brace_depth = line.count('{') - line.count('}')
+                            test_body_lines = []
+                            if brace_depth > 0:
+                                test_body_lines.append(line)
+                            elif '{' in line:
+                                test_body_lines.append(line)
+                                body_text = ''.join(test_body_lines)
+                                for pm in prod_methods:
+                                    if re.search(r'[.]?\b' + re.escape(pm) + r'\s*\(', body_text):
+                                        test_method_calls[current_test].add(pm)
+                                current_test = None
+                            continue
+                else:
+                    brace_depth += line.count('{') - line.count('}')
+                    if brace_depth > 0:
+                        test_body_lines.append(line)
+                    elif brace_depth <= 0:
+                        test_body_lines.append(line)
+                        # End of test method — extract production method calls
+                        body_text = ''.join(test_body_lines)
+                        for pm in prod_methods:
+                            # Check if production method name appears as a call
+                            # Look for .methodName( or methodName( but not in string literals
+                            if re.search(r'[.]' + re.escape(pm) + r'\s*\(', body_text) or \
+                               re.search(r'(?<![.\w])' + re.escape(pm) + r'\s*\(', body_text):
+                                test_method_calls[current_test].add(pm)
+                        current_test = None
+
+    # Compute M_p per test
+    test_mp = {t: len(methods) for t, methods in test_method_calls.items()}
+    max_mp = max(test_mp.values()) if test_mp else 0
+
+    mp_distribution = defaultdict(int)
+    for t, mp in test_mp.items():
+        mp_distribution[mp] += 1
+    mp_warning = f"  (M_p source analysis: {len(test_mp)} tests analyzed)"
 else:
     mp_warning = "  (M_p: Phase 2 — pass --test-src to enable)"
 
@@ -259,6 +350,9 @@ print(f"  R dist:           " + ", ".join(f"{r}k:{cnt}m" for r, cnt in sorted(r_
 # Axiom 3c: M_p (Phase 2)
 if max_mp is not None:
     print(f"  M_p (max):        {max_mp} primary methods/test")
+    if mp_distribution:
+        print(f"  M_p dist:         " + ", ".join(f"{mp}m:{cnt}t" for mp, cnt in sorted(mp_distribution.items())[:8]))
+    print(mp_warning)
 else:
     print(f"  M_p (max):        Phase 2 {mp_warning}")
 
@@ -275,31 +369,31 @@ print()
 tiers = [
     ("Bronze", {
         "instruction": 50, "branch": 40, "mutation": 20,
-        "mt": 10, "r": 15,
+        "mt": 10, "r": 15, "mp": 5,
         "exclusion_ratio": 5.0, "unit_speed": 200,
     }),
     ("Silver", {
         "instruction": 70, "branch": 60, "mutation": 35,
-        "mt": 6, "r": 10,
+        "mt": 6, "r": 10, "mp": 3,
         "exclusion_ratio": 5.0, "unit_speed": 100,
     }),
     ("Gold", {
         "instruction": 85, "branch": 75, "mutation": 50,
-        "mt": 4, "r": 5,
+        "mt": 4, "r": 5, "mp": 2,
         "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 3.0, "unit_speed": 50,
         "requires_full_pit": True,
     }),
     ("Platinum", {
         "instruction": 95, "branch": 90, "mutation": 80,
-        "mt": 3, "r": 3,
+        "mt": 3, "r": 3, "mp": 1,
         "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 2.0, "unit_speed": 30,
         "requires_full_pit": True,
     }),
     ("Perfection", {
         "instruction": 100, "branch": 100, "mutation": 100,
-        "mt": 3, "r": 3,
+        "mt": 3, "r": 3, "mp": 1,
         "test_isolation": True, "has_strategy": True,
         "exclusion_ratio": 1.0, "unit_speed": 10,
         "requires_full_pit": True,
