@@ -257,18 +257,57 @@ if pit_config:
     if 'mutators' in pit_config:
         cfg_mutators = pit_config['mutators']
         has_stronger_mutators = any('STRONGER' in m or 'ALL' in m for m in cfg_mutators)
-    if 'fullMutationMatrix' in pit_config:
-        has_full_matrix = pit_config['fullMutationMatrix']
     if 'enableDefaultIncrementalAnalysis' in pit_config:
         is_partial = pit_config['enableDefaultIncrementalAnalysis']  # treat as partial risk
+    # NOTE: fullMutationMatrix from JSON is circular (same config that PIT uses).
+    # Keep the XML-inferred check (has_full_matrix from line 110) as authoritative.
+
+# Read TEST_STRATEGY.md early (needed for exclusion checks below)
+strategy_content = ""
+if os.path.exists('TEST_STRATEGY.md'):
+    try:
+        with open('TEST_STRATEGY.md') as f:
+            strategy_content = f.read()
+    except:
+        pass
 
 # Compute config violation flags for tier gating
 pit_excluded_classes = pit_config.get('excludedClasses', [])
 pit_excluded_methods = pit_config.get('excludedMethods', [])
+pit_avoid_calls_to = pit_config.get('avoidCallsTo', [])
 pit_incremental = pit_config.get('enableDefaultIncrementalAnalysis', None)
+
+# Standard avoidCallsTo entries that are legitimate for Gradle/Kotlin projects
+# These suppress mutations on framework calls that produce nonsense mutants
+STANDARD_AVOID_CALLS_TO = {
+    'kotlin.jvm.internal.Intrinsics',
+    'org.gradle.api.Project',
+    'org.gradle.api.invocation.Gradle',
+    'org.gradle.api.plugins.PluginManager',
+    'org.gradle.api.provider.Property',
+    'org.gradle.api.provider.Provider',
+    'org.gradle.api.provider.ListProperty',
+    'org.gradle.api.file.ConfigurableFileCollection',
+    'org.gradle.api.file.DirectoryProperty',
+    'org.gradle.api.file.RegularFileProperty',
+    'org.gradle.api.tasks.TaskProvider',
+    'org.gradle.api.tasks.TaskCollection',
+    'org.gradle.api.logging.Logger',
+    'org.gradle.api.execution.TaskExecutionGraph',
+    'org.gradle.api.tasks.Exec',
+    'org.gradle.testing.jacoco.tasks.JacocoReport',
+    'javax.xml.parsers.DocumentBuilderFactory',
+}
+
+# Flag avoidCallsTo entries that are NOT standard (potential gaming)
+undocumented_avoid_calls = [
+    entry for entry in pit_avoid_calls_to
+    if entry not in STANDARD_AVOID_CALLS_TO and entry not in strategy_content
+]
+
 undocumented_excluded_classes = [c for c in pit_excluded_classes if c not in strategy_content] if pit_excluded_classes else []
 undocumented_excluded_methods = [m for m in pit_excluded_methods if m not in strategy_content] if pit_excluded_methods else []
-has_undocumented_exclusions = bool(undocumented_excluded_classes or undocumented_excluded_methods)
+has_undocumented_exclusions = bool(undocumented_excluded_classes or undocumented_excluded_methods or undocumented_avoid_calls)
 has_incremental_risk = pit_incremental is True
 
 # ============ Compute M_t (transitive methods per test) — INFORMATIONAL ONLY ============
@@ -809,6 +848,13 @@ if pit_config:
     print(f"  Excluded classes:       {len(excl_cls)} {'✅' if not excl_cls else '❌'}")
     excl_mth = pit_config.get('excludedMethods', [])
     print(f"  Excluded methods:       {len(excl_mth)} {'✅' if not excl_mth else '❌'}")
+    avoid_calls = pit_config.get('avoidCallsTo', [])
+    undocumented_avoid = [a for a in avoid_calls if a not in STANDARD_AVOID_CALLS_TO and a not in strategy_content]
+    print(f"  avoidCallsTo:           {len(avoid_calls)} entries ({len(undocumented_avoid)} undocumented) {'✅' if not undocumented_avoid else '❌'}")
+    if undocumented_avoid:
+        print(f"    ! Non-standard avoidCallsTo entries:")
+        for a in undocumented_avoid[:5]:
+            print(f"      {a}")
     print(f"  Config source:          {pit_config_source}")
 if no_mutation_classes:
     print(f"\n  WARNING: {len(no_mutation_classes)} classes have JaCoCo branches but NO PIT mutations")
@@ -960,10 +1006,10 @@ for idx, (tier_name, reqs) in enumerate(tiers):
         if max_r > reqs["r"]:
             met = False; failures.append(f"R {max_r} > {reqs['r']} (redundant killers)")
 
-    if "requires_full_pit" in reqs and is_partial:
-        # PIT 1.15 always writes partial="true" — this is a known behavior, not stale cache
-        # Report as informational, don't block
-        pass
+    # PIT incremental analysis gate (Gold+) — uses pit-config.json value
+    # PIT 1.15 always writes partial="true" to XML, so we use the config JSON instead
+    if "requires_full_pit" in reqs and has_incremental_risk:
+        met = False; failures.append("enableDefaultIncrementalAnalysis is true — stale PIT cache risk")
 
     # PIT config verification gates (Gold+)
     if "requires_stronger_mutators" in reqs and not has_stronger_mutators and pit_mutators:
