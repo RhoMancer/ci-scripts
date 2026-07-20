@@ -1,5 +1,6 @@
 #!/bin/sh
-# check-tier.sh v4.2 — Testing Tier System with structurally achievable gates
+# check-tier.sh v4.2 — Anvil Testing System
+# The 3-axiom testing tier system with structurally achievable gates
 #
 # v4.2 changes from v4.1:
 #   - Anti-gaming: exclusion ratio replaced with sliding exclusion scale.
@@ -817,7 +818,7 @@ else:
 
 # ============ Print Results ============
 print("=" * 60)
-print("TESTING TIER REPORT v4.1")
+print("ANVIL TESTING SYSTEM — Tier Report")
 print("=" * 60)
 print()
 print(f"  Instruction:      {instruction_covered}/{instruction_total} = {instruction_pct:.1f}%")
