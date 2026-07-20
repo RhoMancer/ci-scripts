@@ -46,6 +46,7 @@ PIT_XML=""
 JUNIT_DIR=""
 INTEGRATION_JUNIT_DIR=""
 TEST_SRC_DIR=""
+PIT_CONFIG=""
 FLOOR_TIER="Gold"
 
 while [ $# -gt 0 ]; do
@@ -56,6 +57,8 @@ while [ $# -gt 0 ]; do
             INTEGRATION_JUNIT_DIR="$2"; shift 2 ;;
         --test-src)
             TEST_SRC_DIR="$2"; shift 2 ;;
+        --pit-config)
+            PIT_CONFIG="$2"; shift 2 ;;
         *)
             if [ -z "$JACOCO_XML" ]; then JACOCO_XML="$1"
             elif [ -z "$PIT_XML" ]; then PIT_XML="$1"
@@ -73,9 +76,9 @@ if [ ! -f "$JACOCO_XML" ]; then echo "ERROR: JaCoCo XML not found at $JACOCO_XML
 if [ ! -f "$PIT_XML" ]; then echo "ERROR: PIT XML not found at $PIT_XML"; exit 2; fi
 if ! command -v python3 >/dev/null 2>&1; then echo "ERROR: python3 is required"; exit 2; fi
 
-python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" "$TEST_SRC_DIR" << 'PYEOF'
+python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" "$TEST_SRC_DIR" "$PIT_CONFIG" << 'PYEOF'
 import xml.etree.ElementTree as ET
-import sys, os, glob, subprocess, re
+import sys, os, glob, subprocess, re, json
 from collections import defaultdict
 
 jacoco_path = sys.argv[1]
@@ -84,6 +87,7 @@ junit_dir = sys.argv[3] if len(sys.argv) > 3 else ""
 floor_tier = sys.argv[4] if len(sys.argv) > 4 else "Gold"
 integration_junit_dir = sys.argv[5] if len(sys.argv) > 5 else ""
 test_src_dir = sys.argv[6] if len(sys.argv) > 6 else ""
+pit_config_path = sys.argv[7] if len(sys.argv) > 7 else ""
 
 # ============ Parse JaCoCo ============
 jacoco_root = ET.parse(jacoco_path).getroot()
@@ -231,6 +235,41 @@ if pit_mutators and not has_stronger_mutators:
     print("  WARNING: Only DEFAULTS mutators detected — STRONGER not enabled")
     print(f"  Found: {', '.join(found_names)}")
     print("  Mutation score may be inflated. Set mutators.set(listOf(\"STRONGER\")) in PIT config.")
+
+# ============ PIT Config Verification (from pit-config.json) ============
+# If the Gradle dumpPitConfig task produced a JSON config file, use it for
+# authoritative verification. This catches excludedMethods and incremental
+# analysis that can't be detected from mutations.xml alone.
+pit_config = {}
+pit_config_source = "not found"
+if pit_config_path and os.path.isfile(pit_config_path):
+    try:
+        with open(pit_config_path) as f:
+            pit_config = json.load(f)
+        pit_config_source = os.path.basename(pit_config_path)
+    except:
+        pit_config_source = "parse error"
+elif pit_config_path:
+    pit_config_source = f"not found at {pit_config_path}"
+
+# Override XML-inferred values with authoritative config when available
+if pit_config:
+    if 'mutators' in pit_config:
+        cfg_mutators = pit_config['mutators']
+        has_stronger_mutators = any('STRONGER' in m or 'ALL' in m for m in cfg_mutators)
+    if 'fullMutationMatrix' in pit_config:
+        has_full_matrix = pit_config['fullMutationMatrix']
+    if 'enableDefaultIncrementalAnalysis' in pit_config:
+        is_partial = pit_config['enableDefaultIncrementalAnalysis']  # treat as partial risk
+
+# Compute config violation flags for tier gating
+pit_excluded_classes = pit_config.get('excludedClasses', [])
+pit_excluded_methods = pit_config.get('excludedMethods', [])
+pit_incremental = pit_config.get('enableDefaultIncrementalAnalysis', None)
+undocumented_excluded_classes = [c for c in pit_excluded_classes if c not in strategy_content] if pit_excluded_classes else []
+undocumented_excluded_methods = [m for m in pit_excluded_methods if m not in strategy_content] if pit_excluded_methods else []
+has_undocumented_exclusions = bool(undocumented_excluded_classes or undocumented_excluded_methods)
+has_incremental_risk = pit_incremental is True
 
 # ============ Compute M_t (transitive methods per test) — INFORMATIONAL ONLY ============
 test_mt = {t: len(methods) for t, methods in test_methods.items()}
@@ -559,7 +598,12 @@ if test_src_dir and os.path.isdir(test_src_dir):
                     except: pass
 
     # Scan test source files to find what each test directly calls
-    test_method_calls = defaultdict(set)  # test_name -> set of production methods called directly
+    # test_method_calls: method-call syntax ONLY (e.g., obj.getBranchTotal())
+    #   — used for M_p (must avoid false positives from property syntax)
+    # test_all_calls: method-call OR property-access syntax (e.g., obj.branchTotal)
+    #   — used for R_direct (detects Kotlin property-style access to getter/setter methods)
+    test_method_calls = defaultdict(set)  # test_name -> production methods called via method-call syntax (for M_p)
+    test_all_calls = defaultdict(set)     # test_name -> production methods called via any syntax (for R_direct)
 
     for root_d, _, files in os.walk(test_src_dir):
         for f in files:
@@ -598,8 +642,12 @@ if test_src_dir and os.path.isdir(test_src_dir):
                                 test_body_lines.append(line)
                                 body_text = ''.join(test_body_lines)
                                 for pm in prod_methods:
-                                    if is_primary_method_call(pm, body_text):
+                                    is_call = is_primary_method_call(pm, body_text)
+                                    if is_call:
                                         test_method_calls[current_test].add(pm)
+                                        test_all_calls[current_test].add(pm)
+                                    elif is_primary_method_call(pm, body_text, allow_property_matching=True):
+                                        test_all_calls[current_test].add(pm)
                                 current_test = None
                             continue
                 else:
@@ -610,8 +658,12 @@ if test_src_dir and os.path.isdir(test_src_dir):
                         test_body_lines.append(line)
                         body_text = ''.join(test_body_lines)
                         for pm in prod_methods:
-                            if is_primary_method_call(pm, body_text):
+                            is_call = is_primary_method_call(pm, body_text)
+                            if is_call:
                                 test_method_calls[current_test].add(pm)
+                                test_all_calls[current_test].add(pm)
+                            elif is_primary_method_call(pm, body_text, allow_property_matching=True):
+                                test_all_calls[current_test].add(pm)
                         current_test = None
 
     # Compute M_p per test
@@ -625,8 +677,14 @@ if test_src_dir and os.path.isdir(test_src_dir):
 
     # ============ Compute R_direct (direct killers per mutation) ============
     # R_direct(m) = |{tests that kill m AND directly call the mutated method}|
-    # A test "directly calls" a method if the method name is in the test's
-    # primary method set (test_method_calls[test]).
+    # A test "directly calls" a method if the method name (or its Kotlin
+    # property equivalent) is in the test's call set.
+    #
+    # We use test_all_calls (method-call + property-access) rather than
+    # test_method_calls (method-call only) because Kotlin property syntax
+    # (obj.branchTotal) is semantically a direct call to getBranchTotal().
+    # Using test_all_calls here does NOT affect M_p, which uses the stricter
+    # test_method_calls set.
     #
     # This eliminates structural inflation from transitive kills:
     # If testA calls apply() which calls filterExistingDirs(), and testA kills
@@ -640,8 +698,10 @@ if test_src_dir and os.path.isdir(test_src_dir):
         mutated_method = mutation_methods.get(mid, '')
         direct_killers = set()
         for test_name in killers:
-            # Check if this test directly calls the mutated method
-            if mutated_method in test_method_calls.get(test_name, set()):
+            # Check if this test directly calls the mutated method (method-call
+            # or property-access syntax). test_all_calls contains the method
+            # name if EITHER syntax form was found in the test source.
+            if mutated_method in test_all_calls.get(test_name, set()):
                 direct_killers.add(test_name)
         mutation_r_direct[mid] = len(direct_killers)
 
@@ -739,6 +799,17 @@ else:
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
+if pit_config:
+    print(f"\n  --- PIT Config ({pit_config_source}) ---")
+    print(f"  Full mutation matrix:   {'true' if pit_config.get('fullMutationMatrix') else 'FALSE'} {'✅' if pit_config.get('fullMutationMatrix') else '❌'}")
+    print(f"  Incremental analysis:   {pit_config.get('enableDefaultIncrementalAnalysis', '?')} {'✅' if not pit_config.get('enableDefaultIncrementalAnalysis') else '❌'}")
+    cfg_muts = pit_config.get('mutators', [])
+    print(f"  Mutators:               {', '.join(cfg_muts)} {'✅' if any('STRONGER' in m or 'ALL' in m for m in cfg_muts) else '❌'}")
+    excl_cls = pit_config.get('excludedClasses', [])
+    print(f"  Excluded classes:       {len(excl_cls)} {'✅' if not excl_cls else '❌'}")
+    excl_mth = pit_config.get('excludedMethods', [])
+    print(f"  Excluded methods:       {len(excl_mth)} {'✅' if not excl_mth else '❌'}")
+    print(f"  Config source:          {pit_config_source}")
 if no_mutation_classes:
     print(f"\n  WARNING: {len(no_mutation_classes)} classes have JaCoCo branches but NO PIT mutations")
     for cls in sorted(no_mutation_classes)[:10]:
@@ -784,6 +855,8 @@ if use_r_direct:
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
             "requires_full_matrix": True,
+            "no_undocumented_exclusions": True,
+            "no_incremental_analysis": True,
         }),
         ("Platinum", {
             "instruction": 95, "branch": 90, "mutation": 95,
@@ -794,6 +867,8 @@ if use_r_direct:
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
             "requires_full_matrix": True,
+            "no_undocumented_exclusions": True,
+            "no_incremental_analysis": True,
         }),
         ("Perfection", {
             "instruction": 100, "branch": 100, "mutation": 100,
@@ -804,6 +879,8 @@ if use_r_direct:
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
             "requires_full_matrix": True,
+            "no_undocumented_exclusions": True,
+            "no_incremental_analysis": True,
         }),
     ]
 else:
@@ -829,6 +906,8 @@ else:
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
             "requires_full_matrix": True,
+            "no_undocumented_exclusions": True,
+            "no_incremental_analysis": True,
         }),
         ("Platinum", {
             "instruction": 95, "branch": 90, "mutation": 95,
@@ -839,6 +918,8 @@ else:
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
             "requires_full_matrix": True,
+            "no_undocumented_exclusions": True,
+            "no_incremental_analysis": True,
         }),
         ("Perfection", {
             "instruction": 100, "branch": 100, "mutation": 100,
@@ -849,6 +930,8 @@ else:
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
             "requires_full_matrix": True,
+            "no_undocumented_exclusions": True,
+            "no_incremental_analysis": True,
         }),
     ]
 
@@ -891,6 +974,14 @@ for idx, (tier_name, reqs) in enumerate(tiers):
 
     if "requires_full_matrix" in reqs and not has_full_matrix:
         met = False; failures.append("fullMutationMatrix disabled — only singular killingTest found")
+
+    # PIT config JSON gates (Gold+) — only when pit-config.json available
+    if "no_undocumented_exclusions" in reqs and has_undocumented_exclusions:
+        excl = undocumented_excluded_classes + undocumented_excluded_methods
+        met = False; failures.append(f"PIT excludedClasses/excludedMethods has {len(excl)} undocumented entries: {', '.join(excl[:5])}")
+
+    if "no_incremental_analysis" in reqs and has_incremental_risk:
+        met = False; failures.append("enableDefaultIncrementalAnalysis is true — stale PIT cache risk")
 
     if "test_isolation" in reqs and not test_isolation:
         met = False; failures.append("test isolation not verified")
