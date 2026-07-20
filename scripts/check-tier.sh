@@ -1,5 +1,16 @@
 #!/bin/sh
-# check-tier.sh v4.0 — Testing Tier System with structurally achievable gates
+# check-tier.sh v4.1 — Testing Tier System with structurally achievable gates
+#
+# v4.1 changes from v4.0:
+#   - Anti-gaming: speed gate switched from MEAN to MEDIAN (robust against
+#     trivial-test dilution). Mean still reported as informational.
+#   - Anti-gaming: total wall-clock time added as secondary speed gate.
+#     Not gameable by adding trivial tests (they add time).
+#   - Anti-gaming: JUnit test count cross-referenced with PIT test methods.
+#     Warns if >20% discrepancy (possible trivial tests or fake JUnit XML).
+#   - Anti-gaming: zero-mutation-kill diagnostic. Shows how many tests kill
+#     zero mutations, broken down by test class.
+#   - P95 and P99 test times reported as informational metrics.
 #
 # v4.0 changes from v3.0:
 #   - M_t REMOVED as a gate (now informational only). M_t measures call-graph
@@ -27,7 +38,8 @@
 #   Axiom 3b: R_direct — max direct killers per mutation (source analysis) [Phase 2]
 #             Falls back to R (all killers) with lenient thresholds when no source analysis.
 #   Informational: M_t — max transitive methods per test (NOT a gate)
-#   Guardrail: Exclusion ratio, unit test speed, partial PIT detection
+#   Guardrail: Exclusion ratio, median test speed, total wall-clock, partial PIT detection
+#   Anti-gaming: JUnit↔PIT count cross-ref, zero-kill diagnostics
 
 JACOCO_XML=""
 PIT_XML=""
@@ -99,12 +111,15 @@ if not has_full_matrix:
 
 total_mutations = killed_mutations = survived_mutations = no_coverage_mutations = 0
 pit_classes = set()
+pit_mutators = set()
 # Per-mutation: {mut_id: {test_names}}
 mutation_killers = defaultdict(set)
 # Per-test: {test_name: set of (mutatedClass, mutatedMethod)}
 test_methods = defaultdict(set)
 # Per-mutation: {mut_id: (mutatedClass, mutatedMethod)} — method where the mutation lives
 mutation_methods = {}
+# All unique test method names that PIT actually ran (from killingTests + succeedingTests)
+pit_test_names = set()
 
 def extract_method_name(test_full):
     """Extract clean test method name from PIT's JUnit5 unique ID format."""
@@ -139,6 +154,8 @@ for m in pit_root.findall('.//mutation'):
     mut_id = f"{src.text if src is not None else '?'}:{line.text if line is not None else '?'}:{mutator.text.split('.')[-1] if mutator is not None else '?'}:{idx_val}:{block_val}"
 
     if cls_name != '?': pit_classes.add(cls_name)
+    if mutator is not None and mutator.text:
+        pit_mutators.add(mutator.text)
 
     # Build method key (normalized — strip Kotlin module suffix like $gradle_tools)
     method_key = f"{cls_name}::{method_name}"
@@ -155,6 +172,7 @@ for m in pit_root.findall('.//mutation'):
             if test_name:
                 mutation_killers[mut_id].add(test_name)
                 test_methods[test_name].add(method_key)
+                pit_test_names.add(test_name)
     else:
         kt_elem = m.find('killingTest')
         if kt_elem is not None and kt_elem.text:
@@ -162,8 +180,57 @@ for m in pit_root.findall('.//mutation'):
             if test_name:
                 mutation_killers[mut_id].add(test_name)
                 test_methods[test_name].add(method_key)
+                pit_test_names.add(test_name)
+
+    # Parse succeedingTests for cross-reference (tests PIT ran but didn't kill this mutation)
+    st_elem = m.find('succeedingTests')
+    if st_elem is not None and st_elem.text:
+        for test_full in st_elem.text.split('|'):
+            test_name = extract_method_name(test_full)
+            if test_name:
+                pit_test_names.add(test_name)
 
 mutation_pct = killed_mutations * 100 / total_mutations if total_mutations > 0 else 0
+
+# ============ PIT Config Verification (from XML inference) ============
+# Infer PIT configuration quality from mutations.xml to detect config gaming.
+# A developer can inflate the mutation score by:
+#   1. Narrowing targetClasses to exclude hard-to-test classes
+#   2. Adding excludedClasses/excludedMethods for methods with surviving mutations
+#   3. Changing mutators from STRONGER to DEFAULTS (fewer mutations = higher score)
+#   4. Disabling fullMutationMatrix (hides redundant test information)
+#
+# Checks possible from PIT XML alone:
+#   - mutators: if only DEFAULTS present (no STRONGER-exclusive mutators), warn
+#   - fullMutationMatrix: already checked above (has_full_matrix)
+# Checks requiring class comparison (computed later, after JaCoCo parse):
+#   - excludedClasses/targetClasses: classes with JaCoCo branches but no PIT mutations
+
+# Mutators that are ONLY present when STRONGER (or ALL) is configured.
+# Source: PIT StandardMutatorGroups.java —
+#   DEFAULTS = INVERT_NEGS, MATH, VOID_METHOD_CALLS,
+#              REMOVE_CONDITIONALS_ORDER_ELSE, REMOVE_CONDITIONALS_EQUAL_ELSE,
+#              CONDITIONALS_BOUNDARY, INCREMENTS, RETURNS (5 return mutators)
+#   STRONGER = DEFAULTS + EXPERIMENTAL_SWITCH
+#                        + REMOVE_CONDITIONALS_ORDER_IF
+#                        + REMOVE_CONDITIONALS_EQUAL_IF
+# These three are the STRONGER-exclusive markers:
+STRONGER_EXCLUSIVE_MUTATORS = {
+    'RemoveConditionalMutator_EQUAL_IF',
+    'RemoveConditionalMutator_ORDER_IF',
+    'SwitchMutator',
+}
+
+has_stronger_mutators = any(
+    any(marker in mut for marker in STRONGER_EXCLUSIVE_MUTATORS)
+    for mut in pit_mutators
+) if pit_mutators else True  # pass if empty (caught by mutation score)
+
+if pit_mutators and not has_stronger_mutators:
+    found_names = sorted(set(m.split('.')[-1] for m in pit_mutators))
+    print("  WARNING: Only DEFAULTS mutators detected — STRONGER not enabled")
+    print(f"  Found: {', '.join(found_names)}")
+    print("  Mutation score may be inflated. Set mutators.set(listOf(\"STRONGER\")) in PIT config.")
 
 # ============ Compute M_t (transitive methods per test) — INFORMATIONAL ONLY ============
 test_mt = {t: len(methods) for t, methods in test_methods.items()}
@@ -181,34 +248,121 @@ r_distribution = defaultdict(int)
 for mid, r in mutation_r.items():
     r_distribution[r] += 1
 
-# ============ Parse JUnit ============
-test_count = 0
-test_time_seconds = 0.0
-if junit_dir and os.path.isdir(junit_dir):
+# ============ Parse JUnit (with per-test timing) ============
+def parse_junit_dir(junit_dir):
+    """Parse JUnit XML dir, returning aggregate and per-test timing data."""
+    total_count = 0
+    total_time_seconds = 0.0
+    test_times_ms = []          # individual test times in ms
+    test_classes = defaultdict(list)  # classname -> [(test_name, time_ms)]
+    test_names = set()          # all test method names
+    if not junit_dir or not os.path.isdir(junit_dir):
+        return total_count, total_time_seconds, test_times_ms, test_classes, test_names
     for xml_file in glob.glob(os.path.join(junit_dir, '*.xml')):
         try:
             suite = ET.parse(xml_file).getroot()
-            test_count += int(suite.get('tests', 0))
-            test_time_seconds += float(suite.get('time', 0))
-        except: pass
+            total_count += int(suite.get('tests', 0))
+            total_time_seconds += float(suite.get('time', 0))
+            for tc in suite.findall('.//testcase'):
+                tc_name = tc.get('name', '')
+                # Normalize: strip trailing () to match PIT's method name format
+                if tc_name.endswith('()'):
+                    tc_name = tc_name[:-2]
+                tc_class = tc.get('classname', '')
+                tc_time_s = float(tc.get('time', '0'))
+                tc_time_ms = tc_time_s * 1000
+                test_times_ms.append(tc_time_ms)
+                test_classes[tc_class].append((tc_name, tc_time_ms))
+                if tc_name:
+                    test_names.add(tc_name)
+        except:
+            pass
+    return total_count, total_time_seconds, test_times_ms, test_classes, test_names
+
+test_count, test_time_seconds, test_times_ms, junit_test_classes, junit_test_names = parse_junit_dir(junit_dir)
+
+integration_test_count, integration_test_time_seconds, integ_times_ms, _, _ = parse_junit_dir(integration_junit_dir)
+
+# ============ Compute speed metrics (anti-gaming) ============
+# MEAN is gameable: add trivial assertTrue(true) tests at 0ms to dilute it.
+# MEDIAN is robust: adding 100 trivial tests at 0ms barely shifts the median.
+# P95 captures the slowest tests regardless of how many trivial tests are added.
+
+def percentile(sorted_vals, pct):
+    """Compute the pct-th percentile of a sorted list."""
+    if not sorted_vals:
+        return None
+    k = (len(sorted_vals) - 1) * pct / 100
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    if f == c:
+        return sorted_vals[f]
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
 
 avg_test_ms = (test_time_seconds * 1000 / test_count) if test_count > 0 else None
 
-integration_test_count = 0
-integration_test_time_seconds = 0.0
-if integration_junit_dir and os.path.isdir(integration_junit_dir):
-    for xml_file in glob.glob(os.path.join(integration_junit_dir, '*.xml')):
-        try:
-            suite = ET.parse(xml_file).getroot()
-            integration_test_count += int(suite.get('tests', 0))
-            integration_test_time_seconds += float(suite.get('time', 0))
-        except: pass
+sorted_times = sorted(test_times_ms)
+median_test_ms = percentile(sorted_times, 50) if sorted_times else None
+p95_test_ms = percentile(sorted_times, 95) if sorted_times else None
+p99_test_ms = percentile(sorted_times, 99) if sorted_times else None
 
 integration_avg_test_ms = (integration_test_time_seconds * 1000 / integration_test_count) if integration_test_count > 0 else None
+
+# ============ Anti-Gaming: JUnit ↔ PIT cross-reference (Measure A) ============
+# If JUnit reports 200 tests but PIT only ran against 127, the extra 73 might
+# be trivial tests that don't exercise any mutations. We cross-reference test
+# counts to detect this. Also detects fake JUnit XML files with invented tests.
+pit_test_count = len(pit_test_names)
+junit_test_names_count = len(junit_test_names)
+count_discrepancy_pct = 0
+if pit_test_count > 0 and junit_test_names_count > 0:
+    count_discrepancy_pct = abs(junit_test_names_count - pit_test_count) * 100 / max(pit_test_count, junit_test_names_count)
+
+# ============ Anti-Gaming: Zero-mutation-kill diagnostic (Measure B) ============
+# Tests that never kill any mutation are suspicious — they may be trivial
+# assertTrue(true) tests added to dilute the speed metric.
+# test_methods has entries only for tests that kill at least one mutation.
+killing_test_names = set(test_methods.keys())
+zero_kill_tests = junit_test_names - killing_test_names  # JUnit tests that never kill
+zero_kill_by_class = defaultdict(int)
+for cls_name, tests in junit_test_classes.items():
+    for tc_name, _ in tests:
+        if tc_name in zero_kill_tests:
+            zero_kill_by_class[cls_name] += 1
 
 # ============ Test isolation + strategy ============
 test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
 has_strategy = os.path.exists('TEST_STRATEGY.md')
+
+# ============ PIT config: targetClasses / excludedClasses verification ============
+# Compare JaCoCo classes (production code with branches) against PIT mutated
+# classes. If a class has JaCoCo branches but NO PIT mutations, it was either:
+#   - Excluded via excludedClasses
+#   - Not matched by targetClasses (narrowed pattern)
+#   - Genuinely has no mutatable bytecode (rare)
+# At Gold+, undocumented gaps are a gate failure.
+
+_all_jacoco_classes = [n for pkg in jacoco_root.findall('package') for cls in pkg.findall('class') for n in [cls.get('name','')] if n]
+no_mutation_classes = []
+for c in _all_jacoco_classes:
+    c_dotted = c.replace('/', '.')
+    found_in_pit = any(c_dotted.startswith(pc) or pc.startswith(c_dotted) for pc in pit_classes)
+    if not found_in_pit:
+        branch_counters = jacoco_root.findall(f'.//class[@name="{c}"]/counter[@type="BRANCH"]')
+        has_branches = any(int(cnt.get('covered', 0)) + int(cnt.get('missed', 0)) > 0 for cnt in branch_counters)
+        if has_branches:
+            no_mutation_classes.append(c.split('/')[-1])
+
+# Check TEST_STRATEGY.md for documented exclusions
+strategy_content = ""
+if os.path.exists('TEST_STRATEGY.md'):
+    try:
+        with open('TEST_STRATEGY.md') as f:
+            strategy_content = f.read()
+    except:
+        pass
+
+undocumented_excluded = [cls for cls in no_mutation_classes if cls not in strategy_content]
 
 # ============ Exclusion ratio ============
 included_classes = set()
@@ -311,7 +465,67 @@ def is_primary_method_call(method_name, body_text):
     if re.search(r'(?<![.\w])' + re.escape(method_name) + r'\s*\(', body_text):
         return True
 
+    # Pattern 3: Kotlin property access — getXxx()/isXxx()/setXxx() are called
+    # via property syntax in Kotlin (obj.foo, not obj.getFoo()).
+    # PIT reports the JVM-level getter/setter name, but tests use the property name.
+    #   getFoo  → property "foo"     (strip "get", lowercase first char)
+    #   isFoo   → property "isFoo"   (Kotlin keeps the "is" prefix)
+    #              also try "foo"     (fallback for @JvmName or different conventions)
+    #   setFoo  → property "foo"     (strip "set", lowercase first char)
+    kotlin_props = _kotlin_property_names(method_name)
+    for prop_name in kotlin_props:
+        if prop_name in FRAMEWORK_METHODS:
+            continue
+        # Match .propName NOT followed by '(' (so we don't double-match method calls).
+        # The negative lookahead ensures this is property access, not a function call.
+        # We check the receiver the same way as method calls to exclude Gradle/framework receivers.
+        for match in re.finditer(r'(\w+)\s*\.\s*' + re.escape(prop_name) + r'\s*(?!\w|\s*\()', body_text):
+            receiver = match.group(1)
+            if GRADLE_RECEIVERS.search(receiver + '.'):
+                continue  # Skip Gradle API property accesses
+            if receiver in ('project', 'extensions', 'tasks', 'pluginManager',
+                           'rootProject', 'gradle', 'buildDir', 'layout', 'reports',
+                           'dependencies', 'configurations', 'repositories',
+                           'sourceSets', 'plugins', 'group', 'version', 'properties',
+                           'logger', 'objects', 'providers', 'this', 'super', 'it',
+                           'ext', 'test', 'result'):
+                continue  # Skip framework receiver property accesses
+            # This is a property access on a non-framework object — counts as direct
+            return True
+
     return False
+
+
+def _kotlin_property_names(method_name):
+    """Derive Kotlin property name(s) from a JVM getter/setter method name.
+
+    Kotlin follows JavaBeans conventions for property access:
+      getFoo()  → property "foo"
+      isFoo()   → property "isFoo" (Kotlin keeps the "is" prefix for Boolean)
+                   also returns "foo" as a fallback
+      setFoo()  → property "foo"
+      hasFoo()  → not a standard Kotlin property pattern
+
+    Returns a list of candidate property names (may be empty for non-getter methods).
+    """
+    candidates = []
+    # getFoo → foo  (must be followed by uppercase letter)
+    if re.match(r'get[A-Z]', method_name):
+        prop = method_name[3:]            # strip "get"
+        prop = prop[0].lower() + prop[1:] # lowercase first char
+        candidates.append(prop)
+    # isFoo → isFoo (kept as-is), also try foo as fallback
+    elif re.match(r'is[A-Z]', method_name):
+        candidates.append(method_name)     # "isFoo" — Kotlin keeps the prefix
+        prop = method_name[2:]             # strip "is"
+        prop = prop[0].lower() + prop[1:]  # "foo" — fallback
+        candidates.append(prop)
+    # setFoo → foo
+    elif re.match(r'set[A-Z]', method_name):
+        prop = method_name[3:]             # strip "set"
+        prop = prop[0].lower() + prop[1:]  # lowercase first char
+        candidates.append(prop)
+    return candidates
 
 max_mp = None
 max_r_direct = None
@@ -440,7 +654,7 @@ else:
 
 # ============ Print Results ============
 print("=" * 60)
-print("TESTING TIER REPORT v4.0")
+print("TESTING TIER REPORT v4.1")
 print("=" * 60)
 print()
 print(f"  Instruction:      {instruction_covered}/{instruction_total} = {instruction_pct:.1f}%")
@@ -452,12 +666,45 @@ print(f"  PIT run:          {'PARTIAL (stale cache)' if is_partial else 'Complet
 print(f"  Test count:       {test_count} (unit)")
 if integration_test_count > 0:
     print(f"  Integration:      {integration_test_count} tests")
-if avg_test_ms is not None:
-    print(f"  Unit test speed:  {avg_test_ms:.1f}ms/test")
+# Anti-gaming speed metrics — show median (gate) + mean (info) + percentiles
+if median_test_ms is not None:
+    print(f"  Speed (median):   {median_test_ms:.1f}ms/test [GATE]")
+    print(f"  Speed (mean):     {avg_test_ms:.1f}ms/test [info]")
+    print(f"  Speed (P95):      {p95_test_ms:.1f}ms/test [info]")
+    print(f"  Speed (P99):      {p99_test_ms:.1f}ms/test [info]")
+    print(f"  Total wall-clock: {test_time_seconds:.1f}s [GATE]")
 else:
     print(f"  Unit test speed:  N/A")
 if integration_avg_test_ms is not None:
     print(f"  Integ test speed: {integration_avg_test_ms:.1f}ms/test")
+
+# Anti-gaming: JUnit ↔ PIT cross-reference (Measure A)
+print(f"\n  --- Anti-Gaming Checks ---")
+if pit_test_count > 0:
+    print(f"  JUnit tests:      {junit_test_names_count} unique test methods")
+    print(f"  PIT tests:        {pit_test_count} unique test methods")
+    if count_discrepancy_pct > 20:
+        print(f"  ⚠ WARNING: {count_discrepancy_pct:.0f}% discrepancy between JUnit and PIT test counts")
+        print(f"    Possible trivial tests or fake JUnit XML. Investigate.")
+    else:
+        print(f"  Count match:      {count_discrepancy_pct:.0f}% discrepancy (OK)")
+else:
+    print(f"  PIT test count:   unavailable (no fullMutationMatrix?)")
+
+# Anti-gaming: zero-mutation-kill diagnostic (Measure B)
+if zero_kill_tests:
+    zero_pct = len(zero_kill_tests) * 100 / len(junit_test_names) if junit_test_names else 0
+    zero_classes = sum(1 for v in zero_kill_by_class.values() if v > 0)
+    print(f"  Zero-kill tests:  {len(zero_kill_tests)}/{len(junit_test_names)} ({zero_pct:.0f}%) kill no mutations")
+    if zero_classes > 0:
+        print(f"  Zero-kill classes:{zero_classes} class(es) with non-killing tests")
+    # Show top offenders (classes with most zero-kill tests)
+    sorted_zero = sorted(zero_kill_by_class.items(), key=lambda x: -x[1])[:5]
+    for cls, cnt in sorted_zero:
+        if cnt > 0:
+            short_cls = cls.rsplit('.', 1)[-1] if '.' in cls else cls
+            total_in_cls = len(junit_test_classes.get(cls, []))
+            print(f"    ! {short_cls}: {cnt}/{total_in_cls} tests kill nothing")
 
 # M_t — informational only (NOT a gate)
 print(f"\n  --- Informational (not gated) ---")
@@ -490,20 +737,11 @@ else:
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
-_all_jacoco_classes = [n for pkg in jacoco_root.findall('package') for cls in pkg.findall('class') for n in [cls.get('name','')] if n]
-no_mutation_classes = []
-for c in _all_jacoco_classes:
-    c_dotted = c.replace('/', '.')
-    found_in_pit = any(c_dotted.startswith(pc) or pc.startswith(c_dotted) for pc in pit_classes)
-    if not found_in_pit:
-        branch_counters = jacoco_root.findall(f'.//class[@name="{c}"]/counter[@type="BRANCH"]')
-        has_branches = any(int(cnt.get('covered', 0)) + int(cnt.get('missed', 0)) > 0 for cnt in branch_counters)
-        if has_branches:
-            no_mutation_classes.append(c.split('/')[-1])
 if no_mutation_classes:
     print(f"\n  WARNING: {len(no_mutation_classes)} classes have JaCoCo branches but NO PIT mutations")
     for cls in sorted(no_mutation_classes)[:10]:
-        print(f"    ! {cls}")
+        doc_status = "[undocumented]" if cls not in strategy_content else "[documented]"
+        print(f"    ! {cls} {doc_status}")
 print()
 
 # ============ Tier Definitions (v4.0) ============
@@ -528,33 +766,42 @@ if use_r_direct:
         ("Bronze", {
             "instruction": 60, "branch": 50, "mutation": 50,
             "mp": 5, "r_direct": 10,
-            "exclusion_ratio": 5.0, "unit_speed": 200,
+            "exclusion_ratio": 5.0, "median_speed": 200, "total_wall_seconds": 120,
         }),
         ("Silver", {
             "instruction": 80, "branch": 70, "mutation": 70,
             "mp": 4, "r_direct": 6,
-            "exclusion_ratio": 5.0, "unit_speed": 100,
+            "exclusion_ratio": 5.0, "median_speed": 100, "total_wall_seconds": 60,
         }),
         ("Gold", {
             "instruction": 90, "branch": 85, "mutation": 85,
             "mp": 3, "r_direct": 4,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 3.0, "unit_speed": 50,
+            "exclusion_ratio": 3.0, "median_speed": 50, "total_wall_seconds": 30,
             "requires_full_pit": True,
+            "requires_stronger_mutators": True,
+            "no_hidden_exclusions": True,
+            "requires_full_matrix": True,
         }),
         ("Platinum", {
             "instruction": 95, "branch": 90, "mutation": 95,
             "mp": 2, "r_direct": 3,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 2.0, "unit_speed": 30,
+            "exclusion_ratio": 2.0, "median_speed": 30, "total_wall_seconds": 15,
             "requires_full_pit": True,
+            "requires_stronger_mutators": True,
+            "no_hidden_exclusions": True,
+            "requires_full_matrix": True,
         }),
         ("Perfection", {
             "instruction": 100, "branch": 100, "mutation": 100,
             "mp": 2, "r_direct": 3,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 1.0, "unit_speed": 10,
+            "exclusion_ratio": 1.0, "median_speed": 10, "total_wall_seconds": 10,
             "requires_full_pit": True,
+            "requires_stronger_mutators": True,
+            "no_hidden_exclusions": True,
+            "requires_full_matrix": True,
         }),
     ]
 else:
@@ -564,33 +811,42 @@ else:
         ("Bronze", {
             "instruction": 60, "branch": 50, "mutation": 50,
             "r": 20,
-            "exclusion_ratio": 5.0, "unit_speed": 200,
+            "exclusion_ratio": 5.0, "median_speed": 200, "total_wall_seconds": 120,
         }),
         ("Silver", {
             "instruction": 80, "branch": 70, "mutation": 70,
             "r": 12,
-            "exclusion_ratio": 5.0, "unit_speed": 100,
+            "exclusion_ratio": 5.0, "median_speed": 100, "total_wall_seconds": 60,
         }),
         ("Gold", {
             "instruction": 90, "branch": 85, "mutation": 85,
             "r": 8,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 3.0, "unit_speed": 50,
+            "exclusion_ratio": 3.0, "median_speed": 50, "total_wall_seconds": 30,
             "requires_full_pit": True,
+            "requires_stronger_mutators": True,
+            "no_hidden_exclusions": True,
+            "requires_full_matrix": True,
         }),
         ("Platinum", {
             "instruction": 95, "branch": 90, "mutation": 95,
             "r": 6,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 2.0, "unit_speed": 30,
+            "exclusion_ratio": 2.0, "median_speed": 30, "total_wall_seconds": 15,
             "requires_full_pit": True,
+            "requires_stronger_mutators": True,
+            "no_hidden_exclusions": True,
+            "requires_full_matrix": True,
         }),
         ("Perfection", {
             "instruction": 100, "branch": 100, "mutation": 100,
             "r": 5,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 1.0, "unit_speed": 10,
+            "exclusion_ratio": 1.0, "median_speed": 10, "total_wall_seconds": 10,
             "requires_full_pit": True,
+            "requires_stronger_mutators": True,
+            "no_hidden_exclusions": True,
+            "requires_full_matrix": True,
         }),
     ]
 
@@ -624,6 +880,16 @@ for idx, (tier_name, reqs) in enumerate(tiers):
         # Report as informational, don't block
         pass
 
+    # PIT config verification gates (Gold+)
+    if "requires_stronger_mutators" in reqs and not has_stronger_mutators and pit_mutators:
+        met = False; failures.append("STRONGER mutators not enabled — only DEFAULTS detected (mutation score inflated)")
+
+    if "no_hidden_exclusions" in reqs and undocumented_excluded:
+        met = False; failures.append(f"{len(undocumented_excluded)} classes with branches but no PIT mutations (undocumented in TEST_STRATEGY.md)")
+
+    if "requires_full_matrix" in reqs and not has_full_matrix:
+        met = False; failures.append("fullMutationMatrix disabled — only singular killingTest found")
+
     if "test_isolation" in reqs and not test_isolation:
         met = False; failures.append("test isolation not verified")
 
@@ -633,9 +899,14 @@ for idx, (tier_name, reqs) in enumerate(tiers):
     if "exclusion_ratio" in reqs and exclusion_ratio_pct > reqs["exclusion_ratio"]:
         met = False; failures.append(f"exclusion ratio {exclusion_ratio_pct:.1f}% > {reqs['exclusion_ratio']}%")
 
-    if "unit_speed" in reqs and avg_test_ms is not None:
-        if avg_test_ms > reqs["unit_speed"]:
-            met = False; failures.append(f"unit test speed {avg_test_ms:.1f}ms > {reqs['unit_speed']}ms")
+    # Anti-gaming: use MEDIAN test speed (robust against trivial-test dilution)
+    if "median_speed" in reqs and median_test_ms is not None:
+        if median_test_ms > reqs["median_speed"]:
+            met = False; failures.append(f"median test speed {median_test_ms:.1f}ms > {reqs['median_speed']}ms")
+
+    # Anti-gaming: total wall-clock gate (not gameable by adding trivial tests)
+    if "total_wall_seconds" in reqs and test_time_seconds > reqs["total_wall_seconds"]:
+        met = False; failures.append(f"total wall-clock {test_time_seconds:.1f}s > {reqs['total_wall_seconds']}s")
 
     # Phase 2: M_p (only if test source analysis is available)
     if "mp" in reqs and max_mp is not None:
