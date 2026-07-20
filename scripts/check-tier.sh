@@ -1,19 +1,32 @@
 #!/bin/sh
-# check-tier.sh v3.0 — Testing Tier System with hybrid granularity + redundancy gates
+# check-tier.sh v4.0 — Testing Tier System with structurally achievable gates
+#
+# v4.0 changes from v3.0:
+#   - M_t REMOVED as a gate (now informational only). M_t measures call-graph
+#     structure, not test quality. Orchestrator methods like apply() transitively
+#     reach 6+ sub-methods structurally — this is not a test quality issue.
+#   - R replaced by R_direct when source analysis is available. R_direct counts
+#     only tests that DIRECTLY call the mutated method, eliminating structural
+#     inflation from transitive kills. Falls back to R with lenient thresholds
+#     when source analysis is unavailable.
+#   - Tier thresholds redesigned to be structurally achievable for ALL project
+#     types (pure-function libraries, Gradle plugins, web applications).
+#   - M_p source analysis improved to exclude Gradle API receiver patterns.
 #
 # Usage: check-tier.sh [--floor <tier>] [--integration-junit-dir <dir>] [--test-src <dir>]
 #                      <jacoco-xml> <pit-xml> [junit-xml-dir]
 #
 # --floor <tier>               : Minimum tier (default: Gold)
 # --integration-junit-dir <dir>: Integration test JUnit XML dir (separate timing)
-# --test-src <dir>             : Test source dir for M_p source analysis (Phase 2, optional)
+# --test-src <dir>             : Test source dir for M_p/R_direct source analysis
 #
 # Gates enforced:
 #   Axiom 1: Instruction + Branch coverage (JaCoCo)
 #   Axiom 2: Mutation score (PIT)
-#   Axiom 3a: M_t — max transitive methods per test (PIT mutations.xml) [Phase 1]
-#   Axiom 3b: R  — max killers per mutation (PIT killingTests) [Phase 1]
-#   Axiom 3c: M_p — max primary methods per test (source analysis) [Phase 2, optional]
+#   Axiom 3a: M_p — max primary methods per test (source analysis) [Phase 2]
+#   Axiom 3b: R_direct — max direct killers per mutation (source analysis) [Phase 2]
+#             Falls back to R (all killers) with lenient thresholds when no source analysis.
+#   Informational: M_t — max transitive methods per test (NOT a gate)
 #   Guardrail: Exclusion ratio, unit test speed, partial PIT detection
 
 JACOCO_XML=""
@@ -83,12 +96,13 @@ pit_classes = set()
 mutation_killers = defaultdict(set)
 # Per-test: {test_name: set of (mutatedClass, mutatedMethod)}
 test_methods = defaultdict(set)
+# Per-mutation: {mut_id: (mutatedClass, mutatedMethod)} — method where the mutation lives
+mutation_methods = {}
 
 def extract_method_name(test_full):
     """Extract clean test method name from PIT's JUnit5 unique ID format."""
     if '[method:' in test_full:
         raw = test_full.split('[method:')[1]
-        # Remove trailing ] and any ]() suffix artifacts
         method = raw.rstrip(']')
         return method
     return test_full.strip()
@@ -113,7 +127,10 @@ for m in pit_root.findall('.//mutation'):
 
     # Build method key (normalized — strip Kotlin module suffix like $gradle_tools)
     method_key = f"{cls_name}::{method_name}"
-    method_key = re.sub(r'\$.*', '', method_key)  # normalize synthetic suffixes
+    method_key = re.sub(r'\$.*', '', method_key)
+
+    # Store which method this mutation belongs to
+    mutation_methods[mut_id] = method_name
 
     # Parse killingTests (plural, fullMutationMatrix) or killingTest (singular)
     kt_elem = m.find('killingTests')
@@ -133,22 +150,18 @@ for m in pit_root.findall('.//mutation'):
 
 mutation_pct = killed_mutations * 100 / total_mutations if total_mutations > 0 else 0
 
-# ============ Compute M_t (transitive methods per test) ============
-# M_t for each test = number of unique (class, method) pairs it kills mutations in
+# ============ Compute M_t (transitive methods per test) — INFORMATIONAL ONLY ============
 test_mt = {t: len(methods) for t, methods in test_methods.items()}
 max_mt = max(test_mt.values()) if test_mt else 0
 
-# Also compute M_t distribution
 mt_distribution = defaultdict(int)
 for t, mt in test_mt.items():
     mt_distribution[mt] += 1
 
-# ============ Compute R (killers per mutation) ============
-# R for each killed mutation = number of tests that kill it
+# ============ Compute R (all killers per mutation) ============
 mutation_r = {mid: len(killers) for mid, killers in mutation_killers.items() if killers}
 max_r = max(mutation_r.values()) if mutation_r else 0
 
-# R distribution
 r_distribution = defaultdict(int)
 for mid, r in mutation_r.items():
     r_distribution[r] += 1
@@ -217,15 +230,83 @@ included_instr = instruction_covered + instruction_missed
 total_instr = included_instr + excluded_instr_count
 exclusion_ratio_pct = excluded_instr_count * 100 / total_instr if total_instr > 0 else 0
 
-# ============ M_p (Phase 2 — source analysis for primary methods) ============
+# ============ M_p + R_direct (Phase 2 — source analysis) ============
+# Gradle/framework API receiver patterns to exclude from M_p counting.
+# A method call like project.tasks.findByName(...) should NOT count as a
+# primary production method call even if "findByName" happens to match a
+# production method name.
+GRADLE_RECEIVERS = re.compile(
+    r'\b(?:project|extensions|tasks|pluginManager|rootProject|gradle|buildDir|'
+    r'layout|reports|dependencies|configurations|repositories|sourceSets|'
+    r'plugins|group|version|properties|logger|objects|providers|'
+    r'this|super|it)\s*\.\s*'
+)
+
+# Common Gradle/framework/assertion method names that should NOT be counted
+# as primary production methods even if they match a production method name.
+# These are called on Gradle objects or are test framework utilities.
+FRAMEWORK_METHODS = {
+    'apply', 'create', 'register', 'findByName', 'getByName', 'findByType',
+    'getByType', 'dependsOn', 'mustRunAfter', 'shouldRunAfter', 'finalizeBy',
+    'setEnabled', 'isEnabled', 'set', 'get', 'setGroup', 'setDescription',
+    'assertEquals', 'assertNotEquals', 'assertTrue', 'assertFalse',
+    'assertNotNull', 'assertNull', 'assertSame', 'assertNotSame',
+    'assertThrows', 'verify', 'confirm', 'expect',
+    'setUp', 'tearDown', 'beforeEach', 'afterEach', 'beforeAll', 'afterAll',
+    'of', 'from', 'into', 'to', 'with', 'copy', 'add', 'remove', 'put',
+    'contains', 'isEmpty', 'isNotEmpty', 'isPresent', 'isAbsent',
+    'getOrElse', 'getOrNull', 'orElse', 'orNull',
+}
+
+def is_primary_method_call(method_name, body_text):
+    """Check if a production method name appears as a DIRECT call in the test body,
+    excluding Gradle API calls and framework utility calls.
+
+    A call is counted as primary if:
+    1. The method name appears as a call: methodName( or .methodName(
+    2. The receiver is NOT a Gradle/framework object (project., extensions., etc.)
+    3. The method name is NOT a common framework/assertion method name
+    """
+    # Quick check: if it's a known framework method name, skip it
+    if method_name in FRAMEWORK_METHODS:
+        return False
+
+    # Find all occurrences of the method name as a call
+    # Pattern 1: .methodName( — check receiver
+    for match in re.finditer(r'(\w+)\s*\.\s*' + re.escape(method_name) + r'\s*\(', body_text):
+        receiver = match.group(1)
+        # Check if the receiver is a Gradle/framework object
+        if GRADLE_RECEIVERS.search(receiver + '.'):
+            continue  # Skip Gradle API calls
+        # Check if the receiver itself is a known framework variable
+        if receiver in ('project', 'extensions', 'tasks', 'pluginManager',
+                       'rootProject', 'gradle', 'buildDir', 'layout', 'reports',
+                       'dependencies', 'configurations', 'repositories',
+                       'sourceSets', 'plugins', 'group', 'version', 'properties',
+                       'logger', 'objects', 'providers', 'this', 'super', 'it',
+                       'ext', 'test', 'result', 'task'):
+            continue  # Skip framework receiver calls
+        # The receiver is something else (e.g., a plugin instance) — this IS a primary call
+        return True
+
+    # Pattern 2: standalone methodName( — no receiver (implicit this or local variable)
+    # This catches calls like: plugin.registerConvenienceTasks(...)
+    # But also catches: assertEquals(...) — which is filtered by FRAMEWORK_METHODS
+    if re.search(r'(?<![.\w])' + re.escape(method_name) + r'\s*\(', body_text):
+        return True
+
+    return False
+
 max_mp = None
+max_r_direct = None
 mp_warning = ""
+r_direct_warning = ""
+
 if test_src_dir and os.path.isdir(test_src_dir):
-    # Collect all production method names from PIT data
+    # Collect all production method names from PIT data and source
     prod_methods = set()
     for mk in test_methods.values():
         for method_key in mk:
-            # method_key is "ClassName::methodName" — extract method name
             parts = method_key.split('::')
             if len(parts) == 2:
                 prod_methods.add(parts[1])
@@ -241,13 +322,12 @@ if test_src_dir and os.path.isdir(test_src_dir):
                     try:
                         with open(os.path.join(root_d, f)) as fh:
                             content = fh.read()
-                        # Find function definitions: fun methodName( or fun `methodName`(
-                        for match in re.finditer(r'fun\s+[`]?(\w+)[`]?\s*\(', content):
+                        for match in re.finditer(r'fun\s+[`]?(\w+)[` ]?\s*\(', content):
                             prod_methods.add(match.group(1))
                     except: pass
 
     # Scan test source files to find what each test directly calls
-    test_method_calls = defaultdict(set)  # test_name -> set of production methods called
+    test_method_calls = defaultdict(set)  # test_name -> set of production methods called directly
 
     for root_d, _, files in os.walk(test_src_dir):
         for f in files:
@@ -259,15 +339,12 @@ if test_src_dir and os.path.isdir(test_src_dir):
             except:
                 continue
 
-            # Find @Test methods and their bodies
             current_test = None
             brace_depth = 0
             test_body_lines = []
 
             for i, line in enumerate(lines):
-                # Detect @Test annotation followed by fun declaration
                 if current_test is None:
-                    # Match: @Test on previous line, then fun declaration
                     is_test_line = False
                     if '@Test' in line:
                         is_test_line = True
@@ -275,8 +352,7 @@ if test_src_dir and os.path.isdir(test_src_dir):
                         is_test_line = True
 
                     if is_test_line:
-                        # Match fun `test name with spaces`() or fun testName()
-                        test_match = re.search(r'fun\s+[`]?([^`]*(?:`[^`]*)?)[`]?\s*\(', line)
+                        test_match = re.search(r'fun\s+[`]?([^`]*(?:`[^`]*)?)[` ]?\s*\(', line)
                         if test_match:
                             current_test = test_match.group(1).strip()
                             brace_depth = line.count('{') - line.count('}')
@@ -287,7 +363,7 @@ if test_src_dir and os.path.isdir(test_src_dir):
                                 test_body_lines.append(line)
                                 body_text = ''.join(test_body_lines)
                                 for pm in prod_methods:
-                                    if re.search(r'[.]?\b' + re.escape(pm) + r'\s*\(', body_text):
+                                    if is_primary_method_call(pm, body_text):
                                         test_method_calls[current_test].add(pm)
                                 current_test = None
                             continue
@@ -297,13 +373,9 @@ if test_src_dir and os.path.isdir(test_src_dir):
                         test_body_lines.append(line)
                     elif brace_depth <= 0:
                         test_body_lines.append(line)
-                        # End of test method — extract production method calls
                         body_text = ''.join(test_body_lines)
                         for pm in prod_methods:
-                            # Check if production method name appears as a call
-                            # Look for .methodName( or methodName( but not in string literals
-                            if re.search(r'[.]' + re.escape(pm) + r'\s*\(', body_text) or \
-                               re.search(r'(?<![.\w])' + re.escape(pm) + r'\s*\(', body_text):
+                            if is_primary_method_call(pm, body_text):
                                 test_method_calls[current_test].add(pm)
                         current_test = None
 
@@ -315,12 +387,41 @@ if test_src_dir and os.path.isdir(test_src_dir):
     for t, mp in test_mp.items():
         mp_distribution[mp] += 1
     mp_warning = f"  (M_p source analysis: {len(test_mp)} tests analyzed)"
+
+    # ============ Compute R_direct (direct killers per mutation) ============
+    # R_direct(m) = |{tests that kill m AND directly call the mutated method}|
+    # A test "directly calls" a method if the method name is in the test's
+    # primary method set (test_method_calls[test]).
+    #
+    # This eliminates structural inflation from transitive kills:
+    # If testA calls apply() which calls filterExistingDirs(), and testA kills
+    # a mutation in filterExistingDirs(), that kill is TRANSITIVE — testA does
+    # not directly call filterExistingDirs(). So it doesn't count toward R_direct.
+
+    mutation_r_direct = {}
+    for mid, killers in mutation_killers.items():
+        if not killers:
+            continue
+        mutated_method = mutation_methods.get(mid, '')
+        direct_killers = set()
+        for test_name in killers:
+            # Check if this test directly calls the mutated method
+            if mutated_method in test_method_calls.get(test_name, set()):
+                direct_killers.add(test_name)
+        mutation_r_direct[mid] = len(direct_killers)
+
+    max_r_direct = max(mutation_r_direct.values()) if mutation_r_direct else 0
+    r_direct_distribution = defaultdict(int)
+    for mid, rd in mutation_r_direct.items():
+        r_direct_distribution[rd] += 1
+    r_direct_warning = f"  (R_direct: {len(mutation_r_direct)} mutations analyzed)"
 else:
     mp_warning = "  (M_p: Phase 2 — pass --test-src to enable)"
+    r_direct_warning = "  (R_direct: Phase 2 — pass --test-src to enable)"
 
 # ============ Print Results ============
 print("=" * 60)
-print("TESTING TIER REPORT v3.0")
+print("TESTING TIER REPORT v4.0")
 print("=" * 60)
 print()
 print(f"  Instruction:      {instruction_covered}/{instruction_total} = {instruction_pct:.1f}%")
@@ -339,15 +440,26 @@ else:
 if integration_avg_test_ms is not None:
     print(f"  Integ test speed: {integration_avg_test_ms:.1f}ms/test")
 
-# Axiom 3a: M_t
-print(f"  M_t (max):        {max_mt} transitive methods/test")
+# M_t — informational only (NOT a gate)
+print(f"\n  --- Informational (not gated) ---")
+print(f"  M_t (max):        {max_mt} transitive methods/test [INFO — not a gate]")
 print(f"  M_t dist:         " + ", ".join(f"{mt}m:{cnt}t" for mt, cnt in sorted(mt_distribution.items())[:8]))
 
-# Axiom 3b: R
-print(f"  R (max):          {max_r} killers/mutation")
+# R (all killers) — shown for comparison with R_direct
+print(f"\n  --- Axiom 3 Gates ---")
+print(f"  R (all killers):  {max_r} killers/mutation")
 print(f"  R dist:           " + ", ".join(f"{r}k:{cnt}m" for r, cnt in sorted(r_distribution.items())[:8]))
 
-# Axiom 3c: M_p (Phase 2)
+# R_direct — the actual gate (when available)
+if max_r_direct is not None:
+    print(f"  R_direct (max):   {max_r_direct} direct killers/mutation")
+    print(f"  R_direct dist:    " + ", ".join(f"{r}k:{cnt}m" for r, cnt in sorted(r_direct_distribution.items())[:8]))
+    print(r_direct_warning)
+else:
+    print(f"  R_direct:         Phase 2 {r_direct_warning}")
+    print(f"                   (Using R with fallback thresholds)")
+
+# M_p
 if max_mp is not None:
     print(f"  M_p (max):        {max_mp} primary methods/test")
     if mp_distribution:
@@ -363,42 +475,93 @@ if no_mutation_classes := [c for c in [n for pkg in jacoco_root.findall('package
     print(f"\n  WARNING: {len(no_mutation_classes)} classes have JaCoCo branches but NO PIT mutations")
 print()
 
-# ============ Tier Definitions (v3.0) ============
-# TES removed. Replaced by M_t + R + M_p.
-# M_p is Phase 2 — not enforced yet. When --test-src is provided, it's checked.
-tiers = [
-    ("Bronze", {
-        "instruction": 50, "branch": 40, "mutation": 20,
-        "mt": 10, "r": 15, "mp": 5,
-        "exclusion_ratio": 5.0, "unit_speed": 200,
-    }),
-    ("Silver", {
-        "instruction": 70, "branch": 60, "mutation": 35,
-        "mt": 6, "r": 10, "mp": 3,
-        "exclusion_ratio": 5.0, "unit_speed": 100,
-    }),
-    ("Gold", {
-        "instruction": 85, "branch": 75, "mutation": 50,
-        "mt": 4, "r": 5, "mp": 2,
-        "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 3.0, "unit_speed": 50,
-        "requires_full_pit": True,
-    }),
-    ("Platinum", {
-        "instruction": 95, "branch": 90, "mutation": 80,
-        "mt": 3, "r": 3, "mp": 1,
-        "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 2.0, "unit_speed": 30,
-        "requires_full_pit": True,
-    }),
-    ("Perfection", {
-        "instruction": 100, "branch": 100, "mutation": 100,
-        "mt": 3, "r": 3, "mp": 1,
-        "test_isolation": True, "has_strategy": True,
-        "exclusion_ratio": 1.0, "unit_speed": 10,
-        "requires_full_pit": True,
-    }),
-]
+# ============ Tier Definitions (v4.0) ============
+# M_t REMOVED as a gate — it measures call-graph structure, not test quality.
+# R replaced by R_direct when source analysis is available.
+# When source analysis is NOT available, R is used with lenient fallback thresholds
+# that accommodate structural transitive kill inflation.
+#
+# Threshold rationale:
+#   M_p: Gradle plugin tests may need 2-3 primary method calls for integration
+#        verification. Pure-function tests need 1. Thresholds accommodate both.
+#   R_direct: Structural minimum is 1-2 for most codebases (1 direct test per
+#             method). Allows up to 3 for methods tested by multiple focused tests.
+#   R (fallback): Structural minimum is 3-5 for orchestrator-heavy codebases
+#                 (1 direct + 2-4 transitive killers). Thresholds accommodate this.
+
+# Determine which R metric to use
+use_r_direct = max_r_direct is not None
+
+if use_r_direct:
+    tiers = [
+        ("Bronze", {
+            "instruction": 60, "branch": 50, "mutation": 50,
+            "mp": 5, "r_direct": 10,
+            "exclusion_ratio": 5.0, "unit_speed": 200,
+        }),
+        ("Silver", {
+            "instruction": 80, "branch": 70, "mutation": 70,
+            "mp": 4, "r_direct": 6,
+            "exclusion_ratio": 5.0, "unit_speed": 100,
+        }),
+        ("Gold", {
+            "instruction": 90, "branch": 85, "mutation": 85,
+            "mp": 3, "r_direct": 4,
+            "test_isolation": True, "has_strategy": True,
+            "exclusion_ratio": 3.0, "unit_speed": 50,
+            "requires_full_pit": True,
+        }),
+        ("Platinum", {
+            "instruction": 95, "branch": 90, "mutation": 95,
+            "mp": 2, "r_direct": 3,
+            "test_isolation": True, "has_strategy": True,
+            "exclusion_ratio": 2.0, "unit_speed": 30,
+            "requires_full_pit": True,
+        }),
+        ("Perfection", {
+            "instruction": 100, "branch": 100, "mutation": 100,
+            "mp": 2, "r_direct": 3,
+            "test_isolation": True, "has_strategy": True,
+            "exclusion_ratio": 1.0, "unit_speed": 10,
+            "requires_full_pit": True,
+        }),
+    ]
+else:
+    # Fallback: R (all killers) with lenient thresholds that accommodate
+    # structural transitive kill inflation for orchestrator-heavy codebases.
+    tiers = [
+        ("Bronze", {
+            "instruction": 60, "branch": 50, "mutation": 50,
+            "r": 20,
+            "exclusion_ratio": 5.0, "unit_speed": 200,
+        }),
+        ("Silver", {
+            "instruction": 80, "branch": 70, "mutation": 70,
+            "r": 12,
+            "exclusion_ratio": 5.0, "unit_speed": 100,
+        }),
+        ("Gold", {
+            "instruction": 90, "branch": 85, "mutation": 85,
+            "r": 8,
+            "test_isolation": True, "has_strategy": True,
+            "exclusion_ratio": 3.0, "unit_speed": 50,
+            "requires_full_pit": True,
+        }),
+        ("Platinum", {
+            "instruction": 95, "branch": 90, "mutation": 95,
+            "r": 6,
+            "test_isolation": True, "has_strategy": True,
+            "exclusion_ratio": 2.0, "unit_speed": 30,
+            "requires_full_pit": True,
+        }),
+        ("Perfection", {
+            "instruction": 100, "branch": 100, "mutation": 100,
+            "r": 5,
+            "test_isolation": True, "has_strategy": True,
+            "exclusion_ratio": 1.0, "unit_speed": 10,
+            "requires_full_pit": True,
+        }),
+    ]
 
 highest_tier_idx = -1
 
@@ -415,11 +578,13 @@ for idx, (tier_name, reqs) in enumerate(tiers):
     if "mutation" in reqs and mutation_pct < reqs["mutation"]:
         met = False; failures.append(f"mutation {mutation_pct:.1f}% < {reqs['mutation']}%")
 
-    if "mt" in reqs:
-        if max_mt > reqs["mt"]:
-            met = False; failures.append(f"M_t {max_mt} > {reqs['mt']} (mega-test or broad test)")
+    # NOTE: M_t is NOT checked as a gate in v4.0. It is informational only.
 
-    if "r" in reqs:
+    if "r_direct" in reqs and max_r_direct is not None:
+        if max_r_direct > reqs["r_direct"]:
+            met = False; failures.append(f"R_direct {max_r_direct} > {reqs['r_direct']} (redundant direct killers)")
+
+    if "r" in reqs and "r_direct" not in reqs:
         if max_r > reqs["r"]:
             met = False; failures.append(f"R {max_r} > {reqs['r']} (redundant killers)")
 
@@ -457,7 +622,8 @@ for idx, (tier_name, reqs) in enumerate(tiers):
 achieved_tier = tiers[highest_tier_idx][0] if highest_tier_idx >= 0 else "Below Bronze"
 
 print("=" * 60)
-print(f"  TIER: {achieved_tier}")
+r_mode = "R_direct" if use_r_direct else "R (fallback)"
+print(f"  TIER: {achieved_tier}  [{r_mode}]")
 print("=" * 60)
 
 tier_order = ["Below Bronze", "Bronze", "Silver", "Gold", "Platinum", "Perfection"]
