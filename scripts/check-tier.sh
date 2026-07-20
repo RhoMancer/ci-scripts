@@ -428,7 +428,7 @@ FRAMEWORK_METHODS = {
     'getOrElse', 'getOrNull', 'orElse', 'orNull',
 }
 
-def is_primary_method_call(method_name, body_text):
+def is_primary_method_call(method_name, body_text, allow_property_matching=False):
     """Check if a production method name appears as a DIRECT call in the test body,
     excluding Gradle API calls and framework utility calls.
 
@@ -441,9 +441,13 @@ def is_primary_method_call(method_name, body_text):
     if method_name in FRAMEWORK_METHODS:
         return False
 
+    # Strip comments to prevent false positives from method names in comments
+    clean_body = re.sub(r'//.*$', '', body_text, flags=re.MULTILINE)
+    clean_body = re.sub(r'/\*.*?\*/', '', clean_body, flags=re.DOTALL)
+
     # Find all occurrences of the method name as a call
     # Pattern 1: .methodName( — check receiver
-    for match in re.finditer(r'(\w+)\s*\.\s*' + re.escape(method_name) + r'\s*\(', body_text):
+    for match in re.finditer(r'(\w+)\s*\.\s*' + re.escape(method_name) + r'\s*\(', clean_body):
         receiver = match.group(1)
         # Check if the receiver is a Gradle/framework object
         if GRADLE_RECEIVERS.search(receiver + '.'):
@@ -462,16 +466,14 @@ def is_primary_method_call(method_name, body_text):
     # Pattern 2: standalone methodName( — no receiver (implicit this or local variable)
     # This catches calls like: plugin.registerConvenienceTasks(...)
     # But also catches: assertEquals(...) — which is filtered by FRAMEWORK_METHODS
-    if re.search(r'(?<![.\w])' + re.escape(method_name) + r'\s*\(', body_text):
+    if re.search(r'(?<![.\w])' + re.escape(method_name) + r'\s*\(', clean_body):
         return True
 
-    # Pattern 3: Kotlin property access — getXxx()/isXxx()/setXxx() are called
-    # via property syntax in Kotlin (obj.foo, not obj.getFoo()).
-    # PIT reports the JVM-level getter/setter name, but tests use the property name.
-    #   getFoo  → property "foo"     (strip "get", lowercase first char)
-    #   isFoo   → property "isFoo"   (Kotlin keeps the "is" prefix)
-    #              also try "foo"     (fallback for @JvmName or different conventions)
-    #   setFoo  → property "foo"     (strip "set", lowercase first char)
+    # Pattern 3: Kotlin property access — ONLY for R_direct, not M_p
+    # Property matching is too imprecise for M_p (false positives from variable names)
+    if not allow_property_matching:
+        return False
+
     kotlin_props = _kotlin_property_names(method_name)
     for prop_name in kotlin_props:
         if prop_name in FRAMEWORK_METHODS:
@@ -479,7 +481,7 @@ def is_primary_method_call(method_name, body_text):
         # Match .propName NOT followed by '(' (so we don't double-match method calls).
         # The negative lookahead ensures this is property access, not a function call.
         # We check the receiver the same way as method calls to exclude Gradle/framework receivers.
-        for match in re.finditer(r'(\w+)\s*\.\s*' + re.escape(prop_name) + r'\s*(?!\w|\s*\()', body_text):
+        for match in re.finditer(r'(\w+)\s*\.\s*' + re.escape(prop_name) + r'\s*(?!\w|\s*\()', clean_body):
             receiver = match.group(1)
             if GRADLE_RECEIVERS.search(receiver + '.'):
                 continue  # Skip Gradle API property accesses
