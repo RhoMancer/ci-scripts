@@ -90,6 +90,13 @@ branch_pct = branch_covered * 100 / branch_total if branch_total > 0 else 0
 pit_root = ET.parse(pit_path).getroot()
 is_partial = pit_root.get('partial', 'false').lower() == 'true'
 
+# Verify fullMutationMatrix is enabled (killingTests plural present)
+has_full_matrix = any(m.find('killingTests') is not None and m.find('killingTests').text
+                      for m in pit_root.findall('.//mutation') if m.get('status') == 'KILLED')
+if not has_full_matrix:
+    print("  WARNING: fullMutationMatrix appears DISABLED — only singular killingTest found")
+    print("  R and R_direct metrics will be inaccurate. Set fullMutationMatrix.set(true) in PIT config.")
+
 total_mutations = killed_mutations = survived_mutations = no_coverage_mutations = 0
 pit_classes = set()
 # Per-mutation: {mut_id: {test_names}}
@@ -124,7 +131,12 @@ for m in pit_root.findall('.//mutation'):
     mutator = m.find('mutator')
     cls_name = cls_elem.text if cls_elem is not None else '?'
     method_name = method_elem.text if method_elem is not None else '?'
-    mut_id = f"{src.text if src is not None else '?'}:{line.text if line is not None else '?'}:{mutator.text.split('.')[-1] if mutator is not None else '?'}"
+    # Include index/block in mut_id to avoid duplicates when multiple mutations share file:line:mutator
+    idx_elem = m.find('indexes/index')
+    idx_val = idx_elem.text if idx_elem is not None else '?'
+    block_elem = m.find('blocks/block')
+    block_val = block_elem.text if block_elem is not None else '?'
+    mut_id = f"{src.text if src is not None else '?'}:{line.text if line is not None else '?'}:{mutator.text.split('.')[-1] if mutator is not None else '?'}:{idx_val}:{block_val}"
 
     if cls_name != '?': pit_classes.add(cls_name)
 
@@ -227,7 +239,7 @@ for class_dir in class_dirs:
                 excluded_instr_count += instr_count
                 excluded_class_names.append(cls_name.split('/')[-1])
             except: pass
-    break
+    # Process ALL class dirs, not just the first
 
 included_instr = instruction_covered + instruction_missed
 total_instr = included_instr + excluded_instr_count
@@ -478,8 +490,20 @@ else:
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
 print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
-if no_mutation_classes := [c for c in [n for pkg in jacoco_root.findall('package') for cls in pkg.findall('class') for n in [cls.get('name','')] if n] if c.replace('/','.') not in str(pit_classes) and any(int(counter.get('covered',0))+int(counter.get('missed',0))>0 for counter in [cl for cl in jacoco_root.findall(f'.//class[@name="{c}"]/counter[@type="BRANCH"]')])]:
+_all_jacoco_classes = [n for pkg in jacoco_root.findall('package') for cls in pkg.findall('class') for n in [cls.get('name','')] if n]
+no_mutation_classes = []
+for c in _all_jacoco_classes:
+    c_dotted = c.replace('/', '.')
+    found_in_pit = any(c_dotted.startswith(pc) or pc.startswith(c_dotted) for pc in pit_classes)
+    if not found_in_pit:
+        branch_counters = jacoco_root.findall(f'.//class[@name="{c}"]/counter[@type="BRANCH"]')
+        has_branches = any(int(cnt.get('covered', 0)) + int(cnt.get('missed', 0)) > 0 for cnt in branch_counters)
+        if has_branches:
+            no_mutation_classes.append(c.split('/')[-1])
+if no_mutation_classes:
     print(f"\n  WARNING: {len(no_mutation_classes)} classes have JaCoCo branches but NO PIT mutations")
+    for cls in sorted(no_mutation_classes)[:10]:
+        print(f"    ! {cls}")
 print()
 
 # ============ Tier Definitions (v4.0) ============
