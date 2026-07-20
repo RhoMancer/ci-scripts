@@ -44,7 +44,7 @@ Finalized July 15, 2026. Adversarially reviewed and hardened through multiple ro
 
 - **Instrumented test speed**: Same formula for instrumented/emulator tests. N/A if project has none (not counted, not penalized).
 
-- **Exclusion ratio**: `excluded_instr / (excluded_instr + instr_total) * 100`. % of production code excluded from coverage. Tracks gaming. High exclusions = gaming coverage. Handles equivalent mutants — if you exclude them, the ratio tracks how much.
+- **Exclusion ratio (sliding scale)**: `excluded_instr / (excluded_instr + instr_total) * 100` for display. Gate uses `min(N * pct/100, cap)` — percentage for small repos, absolute cap for large repos. Tracks gaming. High exclusions = gaming coverage. Perfection = zero tolerance (0 excluded).
 
 ## Tier Calculation
 A repo's tier is the HIGHEST tier where ALL required metrics are met. If any metric for a tier is not met, the repo cannot be at that tier or any tier above it.

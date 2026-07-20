@@ -1,8 +1,13 @@
 # Testing Tier System — Formal Specification
 
-**Version:** 3.0
+**Version:** 3.1
 **Status:** Source of truth
 **Supersedes:** Version 2.0 (retained in git history); `TEST_TIER_SYSTEM.md` (informal predecessor, retained for historical context only)
+
+**v3.1 Changes (Sliding Exclusion Scale):**
+- **Exclusion ratio replaced with sliding exclusion scale.** Fixed percentage thresholds were gameable for large repos: 1% of 100,000 instructions = 1,000 instructions that could be hidden (several full classes). The new formula uses `min(N * pct/100, absolute_cap)` — small repos use percentage, large repos hit the absolute cap.
+- **Perfection is now zero-tolerance.** At Perfection, zero excluded instructions are allowed. Zero is zero regardless of repo size; no scaling is needed.
+- **Absolute caps chosen to prevent hiding meaningful code.** A business-logic class has ~100+ instructions. Gold caps at 100 (can't hide even one class), Platinum at 50, Perfection at 0.
 
 **v3.0 Changes (Structural Achievability Fix):**
 - **M_t REMOVED as a gate** (now informational only). M_t measures call-graph structure, not test quality. Orchestrator methods (e.g., Gradle plugin `apply()`) structurally reach 6+ sub-methods. Penalizing this conflates good integration testing with mega-testing.
@@ -489,13 +494,48 @@ integration_test_speed = total_integration_test_time_ms / integration_test_count
 
 **N/A handling:** If the project has no integration tests (`integration_test_count == 0`), the metric is `N/A` and does not block any tier. A project without integration tests is not penalized.
 
-### 2.9 Exclusion Ratio
+### 2.9 Exclusion Ratio (Sliding Scale)
 
-**Formula:**
+**Formula (v3.1 — Sliding Scale):**
+
+The exclusion ratio is computed as a raw percentage, but the **gate** uses a sliding threshold that combines a percentage with an absolute instruction cap:
 
 ```
 exclusion_ratio = excluded_instructions / (excluded_instructions + included_instructions) * 100
+
+max_allowed_excluded = min(N * tier_pct / 100, tier_cap)
+
+where N = excluded_instructions + included_instructions (total instructions)
 ```
+
+The gate **passes** when `excluded_instructions <= max_allowed_excluded`.
+
+**Tier-specific parameters:**
+
+| Tier | Percentage (`pct`) | Absolute Cap (`cap`) | Transition Point (N_t) |
+|------|-------------------|---------------------|----------------------|
+| Bronze | 5.0% | 200 instr | 4,000 instr |
+| Silver | 5.0% | 150 instr | 3,000 instr |
+| Gold | 3.0% | 100 instr | 3,333 instr |
+| Platinum | 2.0% | 50 instr | 2,500 instr |
+| Perfection | 0.0% | 0 instr | N/A (zero tolerance) |
+
+Below the transition point N_t, the percentage governs. Above N_t, the absolute cap governs.
+
+**Why a sliding scale? (v3.1 change)**
+
+Fixed percentage thresholds are gameable for large repos. At Perfection's old threshold of 1%, a repo with 100,000 instructions could exclude 1,000 instructions — enough to hide several full business-logic classes from coverage measurement. The sliding scale bounds the absolute number of hideable instructions regardless of repo size.
+
+**Proof of non-gameability:**
+Since `min(a, b) <= b`, `max_allowed_excluded <= tier_cap` for ALL repo sizes. A developer can hide at most `cap` instructions regardless of repo size. A meaningful business-logic class has >=100 instructions, so Gold (cap=100) prevents hiding even one full class. Perfection (cap=0) prevents hiding anything.
+
+**Proof of monotonicity:**
+For N <= N_t: effective percentage = `tier_pct` (constant). For N > N_t: effective percentage = `cap / N * 100` (monotonically decreasing). At N_t: both cases give `tier_pct` (continuous). Therefore the effective percentage is monotonically non-increasing.
+
+**Proof of achievability for small repos:**
+For N <= N_t: `max_allowed = N * pct / 100` (proportional to N). A repo with 0 excluded instructions always passes (0 <= any non-negative threshold).
+
+**Perfection = zero tolerance.** At Perfection, both `pct` and `cap` are 0. Zero excluded instructions means zero hidden code. No scaling is needed — zero is zero regardless of repo size.
 
 **Data source:** JaCoCo XML report (for `included_instructions`) and compiled `.class` files on disk (for `excluded_instructions`).
 
@@ -509,11 +549,13 @@ exclusion_ratio = excluded_instructions / (excluded_instructions + included_inst
    c. If present, the class is **included** — skip it.
    d. If not present, the class is **excluded** — count its bytecode instructions using `javap -c` (count lines that look like bytecode instructions: non-empty, contain `:`, and are not comments).
    e. `excluded_instructions += instruction_count`.
-4. `exclusion_ratio = excluded_instructions / (excluded_instructions + included_instructions) * 100`.
+4. `total_instructions = excluded_instructions + included_instructions`.
+5. `max_allowed = min(total_instructions * tier_pct / 100, tier_cap)`.
+6. Gate passes when `excluded_instructions <= max_allowed`.
 
-**Unit:** Percentage, one decimal place.
+**Unit:** The ratio is reported as a percentage. The gate operates on absolute instruction counts.
 
-**Semantics:** Measures the fraction of production bytecode that is excluded from coverage measurement. A high exclusion ratio indicates that the project is excluding significant code from coverage, which may be gaming the coverage metrics. Exclusions are legitimate for equivalent mutants, generated code, and code that cannot be meaningfully tested (e.g., DI module classes), but the ratio tracks how much is excluded.
+**Semantics:** Measures the fraction of production bytecode that is excluded from coverage measurement. A high exclusion ratio indicates that the project is excluding significant code from coverage, which may be gaming the coverage metrics. Exclusions are legitimate for equivalent mutants, generated code, and code that cannot be meaningfully tested (e.g., DI module classes), but the ratio tracks how much is excluded. The sliding scale ensures that the absolute amount of hideable code is bounded regardless of repo size.
 
 **Inner class handling:** Inner classes (e.g., `Foo$Bar`) are attributed to their outer class (`Foo`). If the outer class is in JaCoCo, the inner class is considered included. This prevents Kotlin companion objects, data class generated methods, and other compiler-generated inner classes from inflating the exclusion ratio.
 
@@ -521,8 +563,8 @@ exclusion_ratio = excluded_instructions / (excluded_instructions + included_inst
 - Walk the compiled class output directory (configurable via `--class-dir` argument, default: `build/classes/kotlin/main` with fallback to `build/classes/java/main`).
 - For each `.class` file not in the JaCoCo XML, count bytecode instructions using `javap -c`.
 - Inner classes (`$` in name) are attributed to their outer class.
-- The exclusion ratio is computed and compared against the tier threshold.
-- If the exclusion ratio exceeds the threshold, the tier gate fails.
+- Compute `max_allowed = min(N * pct/100, cap)` and compare against `excluded_instructions`.
+- If `excluded_instructions > max_allowed`, the tier gate fails.
 
 ### 2.10 Test Isolation
 
@@ -831,7 +873,7 @@ A repository's tier is the **highest** tier where **ALL** required metrics are m
 | M_t (max transitive methods per test) | info | info | info | info | **info** |
 | Unit test speed | < 200ms | < 100ms | < 50ms | < 30ms | **< 10ms** |
 | Integration test speed | < 10s | < 5s | < 3s | < 2s | **< 0.5s** |
-| Exclusion ratio | < 5% | < 5% | < 3% | < 2% | **< 1%** |
+| Exclusion (pct/cap) | <5% / 200 | <5% / 150 | <3% / 100 | <2% / 50 | **0 / 0 (zero)** |
 | Test isolation | Optional | Optional | Required | Required | Required |
 | Documented strategy | Optional | Optional | Required | Required | Required |
 | Full PIT matrix required | No | No | Yes | Yes | Yes |
@@ -871,6 +913,14 @@ M_t is now informational only. It was removed because it measures call-graph str
 **Full PIT matrix requirement:**
 - Bronze and Silver: `fullMutationMatrix` is not required. Gate 3b (R_direct) is evaluated using the fallback R metric with lenient thresholds. Without the full matrix, only one killing test is reported per mutation, and R is always 1 (trivially passing). The fallback R thresholds accommodate this.
 - Gold and above: `fullMutationMatrix=true` is REQUIRED. Without it, R_direct cannot be computed accurately and the system uses R with fallback thresholds, which are more lenient. The tier may be capped at Silver if the data quality is insufficient.
+
+**Exclusion scale thresholds (v3.1 — Sliding Scale):**
+The exclusion gate uses `min(N * pct/100, cap)` where N = total instructions. This replaces fixed percentages (which were gameable for large repos — 1% of 100K = 1,000 hidden instructions).
+- **Bronze** (5%, cap 200): Below 4,000 instr, 5% governs. Above, capped at 200 instructions (~1 small excluded class).
+- **Silver** (5%, cap 150): Below 3,000 instr, 5% governs. Above, capped at 150 instructions.
+- **Gold** (3%, cap 100): Below 3,333 instr, 3% governs. Above, capped at 100 instructions. A business-logic class has >=100 instructions, so this prevents hiding even one full class.
+- **Platinum** (2%, cap 50): Below 2,500 instr, 2% governs. Above, capped at 50 instructions (minimal framework boilerplate only).
+- **Perfection** (0%, cap 0): Zero tolerance. Zero excluded instructions. No scaling needed — zero is zero.
 
 **Partial PIT cap:**
 - If the PIT run is `partial="true"`, the tier is capped at Silver regardless of other metrics. See Section 3.8.
@@ -1232,12 +1282,12 @@ Metrics:
 - M_p = 1. <= 1 PASS.
 - M_t = 1. <= 3 PASS.
 - R = 1. <= 3 PASS.
-- Exclusion ratio: 0% (nothing excluded). < 1% PASS.
+- Exclusion: 0/100 instr (0.0%). Zero tolerance = 0 excluded. PASS.
 - All gates pass at Perfection.
 
 **This is achievable only for codebases where:**
 1. No production method calls another production method (all methods are leaf methods, or all inter-method calls are mocked in tests).
-2. No equivalent mutants exist (or all are excluded from PIT, with exclusion ratio < 1%).
+2. No equivalent mutants exist (or all are excluded from PIT, with zero excluded instructions).
 3. Every instruction and branch is covered.
 4. Every mutation is killed.
 5. Each test exercises exactly 1 primary method.
@@ -1256,7 +1306,7 @@ Any of the following conditions block Perfection:
 - A single test that transitively reaches 4+ methods (M_t > 3).
 - A single mutation killed by 4+ tests (R > 3).
 - An equivalent mutant that is not excluded (mutation < 100%).
-- An exclusion ratio >= 1% (too much code excluded).
+- Any excluded instructions at all (Perfection requires zero excluded — zero tolerance).
 
 ---
 
@@ -1271,7 +1321,7 @@ A Perfection-tier test suite satisfies ALL of the following simultaneously:
 3. **100% mutation score:** Every mutation generated by PIT is killed by at least one test. No mutations survive. No mutations have NO_COVERAGE. No equivalent mutants are present (they must be excluded from PIT via configuration).
 4. **M_p <= 2:** Each test directly calls at most 2 production methods. Tests calling 3+ production methods directly are mega-tests.
 5. **R_direct <= 3:** Each mutation is killed by at most 3 tests that directly call the mutated method. Transitive kills (from orchestrator tests) are NOT counted.
-6. **Exclusion ratio < 1%:** Less than 1% of production bytecode is excluded from coverage measurement.
+6. **Zero excluded instructions:** Zero production bytecode instructions are excluded from coverage measurement. Perfection uses zero tolerance — no sliding scale needed, zero is zero regardless of repo size.
 7. **Test isolation verified:** Tests pass with randomized execution order.
 8. **Documented strategy:** `TEST_STRATEGY.md` exists and documents the testing approach.
 9. **Full PIT matrix:** `fullMutationMatrix=true` is configured. The PIT run is not partial.
@@ -1306,14 +1356,14 @@ Both barriers are eliminated in v3.0:
 |---------|--------|------------|
 | ~~Inter-method calls inflate M_t~~ | ~~M_t > 3~~ | **RESOLVED: M_t removed as gate in v3.0** |
 | ~~Transitive kills inflate R~~ | ~~R > 3~~ | **RESOLVED: R_direct replaces R in v3.0** |
-| Equivalent mutants in data class methods | Mutation score < 100% | Exclude equivalent mutants from PIT; keep exclusion ratio < 1% |
+| Equivalent mutants in data class methods | Mutation score < 100% | Exclude equivalent mutants from PIT; keep excluded instructions within tier cap |
 | Surviving mutations | Mutation score < 100% | Kill or exclude all surviving mutations |
 | M_p > 2 (tests calling 3+ primary methods) | Blocks Platinum/Perfection | Fix source analysis to exclude Gradle API calls; break tests that genuinely call 3+ production methods |
 | Unit test speed > 10ms | Blocks Perfection | Structural for ProjectBuilder-based tests; may require test class consolidation |
 
 **Verdict (v3.0):** Perfection is **structurally reachable** for a Gradle plugin library if and only if:
 1. ~~M_t is manageable~~ — N/A, M_t is not a gate.
-2. All equivalent mutants are identified and excluded from PIT, with the exclusion ratio remaining below 1%.
+2. All equivalent mutants are identified and excluded from PIT, with zero excluded instructions (Perfection = zero tolerance).
 3. Every instruction, branch, and mutation is covered/killed (mutation score = 100%).
 4. Each test exercises at most 2 primary methods (M_p <= 2). With correct source analysis excluding Gradle API calls, this is achievable.
 5. Each mutation is killed by at most 3 tests that directly call the mutated method (R_direct <= 3). With transitive kills excluded, this is achievable.
@@ -1326,7 +1376,7 @@ For most real-world Gradle plugin libraries (v3.0), the practical ceiling is:
 
 - **Gold** is achievable with moderate effort: 90%+ instruction coverage, 85%+ branch coverage, 85%+ mutation score, M_p <= 3, R_direct <= 4. M_t is not a gate.
 - **Platinum** is achievable with focused effort: 95%+ instruction coverage, 90%+ branch coverage, 95%+ mutation score, M_p <= 2, R_direct <= 3. Requires well-focused tests and correct M_p source analysis (excluding Gradle API calls).
-- **Perfection** is achievable when all mutations are killed or properly excluded: 100% coverage, 100% mutation score, M_p <= 2, R_direct <= 3, exclusion ratio < 1%, unit test speed < 10ms. The speed threshold may be the hardest barrier for ProjectBuilder-based test suites.
+- **Perfection** is achievable when all mutations are killed or properly excluded: 100% coverage, 100% mutation score, M_p <= 2, R_direct <= 3, zero excluded instructions (zero-tolerance), unit test speed < 10ms. The speed threshold may be the hardest barrier for ProjectBuilder-based test suites.
 
 The tier system is designed so that Gold is the default floor (Section 4.4), Platinum is the stretch goal, and Perfection is achievable for well-tested codebases of ALL types — including Gradle plugin libraries — without production code refactoring.
 
@@ -1342,7 +1392,7 @@ This section documents the known limitations of the Testing Tier System honestly
 
 **Impact:** A test that transitively reaches 10 methods but only 3 of them have mutations will have `M_t = 3`, not 10. The test appears finer-grained than it actually is. This could allow a facade mega-test to pass Gate 3b if the transitive methods happen to have few mutations.
 
-**Mitigation:** The exclusion ratio (Section 2.9) tracks how much code is excluded from PIT. If the exclusion ratio is low (< 1% at Perfection), the undercount is minimal. The `check-tier.sh` script's warning for "classes with branches but no mutations" helps identify methods with 0 mutations. The project should document in `TEST_STRATEGY.md` which methods have 0 mutations and why.
+**Mitigation:** The exclusion ratio (Section 2.9) tracks how much code is excluded from JaCoCo. If the exclusion count is within the tier cap (0 at Perfection), the undercount is minimal. The `check-tier.sh` script's warning for "classes with branches but no mutations" helps identify methods with 0 mutations. The project should document in `TEST_STRATEGY.md` which methods have 0 mutations and why.
 
 **Unresolved:** There is no way to compute the true transitive reach of a test (including methods with 0 mutations) from PIT data alone. This would require call-graph analysis from the test's bytecode, which is a future enhancement.
 

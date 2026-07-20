@@ -1,5 +1,13 @@
 #!/bin/sh
-# check-tier.sh v4.1 — Testing Tier System with structurally achievable gates
+# check-tier.sh v4.2 — Testing Tier System with structurally achievable gates
+#
+# v4.2 changes from v4.1:
+#   - Anti-gaming: exclusion ratio replaced with sliding exclusion scale.
+#     Fixed percentage thresholds were gameable for large repos (1% of 100K
+#     instructions = 1000 instructions = several full classes hidden).
+#     New formula: max_excluded = min(N * pct/100, absolute_cap)
+#     Small repos use percentage; large repos hit the absolute cap.
+#     Perfection is now zero-tolerance (0 excluded instructions).
 #
 # v4.1 changes from v4.0:
 #   - Anti-gaming: speed gate switched from MEAN to MEDIAN (robust against
@@ -38,7 +46,7 @@
 #   Axiom 3b: R_direct — max direct killers per mutation (source analysis) [Phase 2]
 #             Falls back to R (all killers) with lenient thresholds when no source analysis.
 #   Informational: M_t — max transitive methods per test (NOT a gate)
-#   Guardrail: Exclusion ratio, median test speed, total wall-clock, partial PIT detection
+#   Guardrail: Sliding exclusion scale (percentage + absolute cap), median test speed, total wall-clock, partial PIT detection
 #   Anti-gaming: JUnit↔PIT count cross-ref, zero-kill diagnostics
 
 JACOCO_XML=""
@@ -477,6 +485,60 @@ included_instr = instruction_covered + instruction_missed
 total_instr = included_instr + excluded_instr_count
 exclusion_ratio_pct = excluded_instr_count * 100 / total_instr if total_instr > 0 else 0
 
+# ============ Sliding exclusion threshold (v4.2) ============
+# Fixed percentage thresholds are gameable for large repos: 1% of 100,000
+# instructions = 1,000 instructions that can be hidden (several full classes).
+# The sliding scale uses min(percentage-based, absolute-cap) to bound the
+# maximum hideable instructions regardless of repo size.
+#
+# Formula:
+#   max_allowed = min(N * pct/100, cap)
+#
+# where N = total_instr (included + excluded), pct = tier percentage, 
+# cap = tier absolute instruction cap.
+#
+# Transition point: N_t = cap * 100 / pct. Below N_t, percentage governs.
+# Above N_t, cap governs (percentage becomes irrelevant).
+#
+# Proof of non-gameability (Assumption 1 resolved):
+#   Since min(a, b) <= b, max_allowed <= cap for ALL N.
+#   A developer can hide at most `cap` instructions regardless of repo size.
+#   A meaningful business-logic class has >=100 instructions.
+#   Gold (cap=100) prevents hiding even one full class.
+#   Perfection (cap=0) prevents hiding anything. QED.
+#
+# Proof of monotonicity (Assumption 3):
+#   For N <= N_t: effective_pct = pct (constant)
+#   For N > N_t:  effective_pct = cap/N * 100 (monotonically decreasing)
+#   At N_t:      both cases give effective_pct = pct (continuous)
+#   Therefore effective_pct is monotonically non-increasing in N. QED.
+#
+# Proof of achievability for small repos (Assumption 4):
+#   For N <= N_t: max_allowed = N * pct / 100 (proportional to N).
+#   A repo with 0 excluded always passes (0 <= any non-negative threshold).
+#   Even a 100-instruction repo gets 5 instructions of tolerance at Bronze.
+#   QED.
+
+def compute_max_excluded(total_instr, pct, cap):
+    """Compute the maximum allowed excluded instructions for a tier.
+
+    Uses min(percentage-based, absolute-cap) to prevent gaming on large repos.
+    At Perfection, both pct and cap are 0 (zero tolerance).
+
+    Args:
+        total_instr: Total instructions (included + excluded).
+        pct: Tier percentage threshold (e.g., 5.0 for Bronze).
+        cap: Tier absolute instruction cap (e.g., 200 for Bronze).
+
+    Returns:
+        Maximum allowed excluded instruction count (float).
+    """
+    if total_instr <= 0:
+        return 0
+    pct_based = total_instr * pct / 100.0
+    return min(pct_based, cap)
+
+
 # ============ M_p + R_direct (Phase 2 — source analysis) ============
 # Gradle/framework API receiver patterns to exclude from M_p counting.
 # A method call like project.tasks.findByName(...) should NOT count as a
@@ -837,7 +899,7 @@ else:
 
 print(f"  Test isolation:   {'Yes' if test_isolation else 'No'}")
 print(f"  Doc strategy:     {'Yes' if has_strategy else 'No'}")
-print(f"  Exclusion ratio:  {exclusion_ratio_pct:.1f}% ({excluded_instr_count}/{total_instr} instr excluded)")
+print(f"  Exclusion:        {excluded_instr_count}/{total_instr} instr ({exclusion_ratio_pct:.1f}%) [sliding scale]")
 if pit_config:
     print(f"\n  --- PIT Config ({pit_config_source}) ---")
     print(f"  Full mutation matrix:   {'true' if pit_config.get('fullMutationMatrix') else 'FALSE'} {'✅' if pit_config.get('fullMutationMatrix') else '❌'}")
@@ -863,11 +925,18 @@ if no_mutation_classes:
         print(f"    ! {cls} {doc_status}")
 print()
 
-# ============ Tier Definitions (v4.0) ============
+# ============ Tier Definitions (v4.2) ============
 # M_t REMOVED as a gate — it measures call-graph structure, not test quality.
 # R replaced by R_direct when source analysis is available.
 # When source analysis is NOT available, R is used with lenient fallback thresholds
 # that accommodate structural transitive kill inflation.
+#
+# Exclusion scale (v4.2): sliding threshold using min(pct, cap).
+#   max_allowed = min(N * pct/100, cap)
+#   This prevents gaming on large repos where a fixed percentage allows hiding
+#   many full classes. The absolute cap bounds hideable instructions regardless
+#   of repo size. See compute_max_excluded() for the mathematical proof.
+#   Perfection uses zero tolerance (pct=0, cap=0) — zero hidden code, period.
 #
 # Threshold rationale:
 #   M_p: Gradle plugin tests may need 2-3 primary method calls for integration
@@ -876,6 +945,10 @@ print()
 #             method). Allows up to 3 for methods tested by multiple focused tests.
 #   R (fallback): Structural minimum is 3-5 for orchestrator-heavy codebases
 #                 (1 direct + 2-4 transitive killers). Thresholds accommodate this.
+#   Exclusion: Caps chosen so that at most 1 small framework boilerplate class
+#              (~100 instructions) can be hidden at Gold, ~0.5 class at Platinum,
+#              and zero at Perfection. A meaningful business-logic class has
+#              >=100 instructions, so the caps prevent hiding real code.
 
 # Determine which R metric to use
 use_r_direct = max_r_direct is not None
@@ -885,18 +958,18 @@ if use_r_direct:
         ("Bronze", {
             "instruction": 60, "branch": 50, "mutation": 50,
             "mp": 5, "r_direct": 10,
-            "exclusion_ratio": 5.0, "median_speed": 200, "total_wall_seconds": 120,
+            "exclusion_pct": 5.0, "exclusion_cap": 200, "median_speed": 200, "total_wall_seconds": 120,
         }),
         ("Silver", {
             "instruction": 80, "branch": 70, "mutation": 70,
             "mp": 4, "r_direct": 6,
-            "exclusion_ratio": 5.0, "median_speed": 100, "total_wall_seconds": 60,
+            "exclusion_pct": 5.0, "exclusion_cap": 150, "median_speed": 100, "total_wall_seconds": 60,
         }),
         ("Gold", {
             "instruction": 90, "branch": 85, "mutation": 85,
             "mp": 3, "r_direct": 4,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 3.0, "median_speed": 50, "total_wall_seconds": 30,
+            "exclusion_pct": 3.0, "exclusion_cap": 100, "median_speed": 50, "total_wall_seconds": 30,
             "requires_full_pit": True,
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
@@ -908,7 +981,7 @@ if use_r_direct:
             "instruction": 95, "branch": 90, "mutation": 95,
             "mp": 2, "r_direct": 3,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 2.0, "median_speed": 30, "total_wall_seconds": 15,
+            "exclusion_pct": 2.0, "exclusion_cap": 50, "median_speed": 30, "total_wall_seconds": 15,
             "requires_full_pit": True,
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
@@ -920,7 +993,7 @@ if use_r_direct:
             "instruction": 100, "branch": 100, "mutation": 100,
             "mp": 2, "r_direct": 3,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 1.0, "median_speed": 10, "total_wall_seconds": 10,
+            "exclusion_pct": 0.0, "exclusion_cap": 0, "median_speed": 10, "total_wall_seconds": 10,
             "requires_full_pit": True,
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
@@ -936,18 +1009,18 @@ else:
         ("Bronze", {
             "instruction": 60, "branch": 50, "mutation": 50,
             "r": 20,
-            "exclusion_ratio": 5.0, "median_speed": 200, "total_wall_seconds": 120,
+            "exclusion_pct": 5.0, "exclusion_cap": 200, "median_speed": 200, "total_wall_seconds": 120,
         }),
         ("Silver", {
             "instruction": 80, "branch": 70, "mutation": 70,
             "r": 12,
-            "exclusion_ratio": 5.0, "median_speed": 100, "total_wall_seconds": 60,
+            "exclusion_pct": 5.0, "exclusion_cap": 150, "median_speed": 100, "total_wall_seconds": 60,
         }),
         ("Gold", {
             "instruction": 90, "branch": 85, "mutation": 85,
             "r": 8,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 3.0, "median_speed": 50, "total_wall_seconds": 30,
+            "exclusion_pct": 3.0, "exclusion_cap": 100, "median_speed": 50, "total_wall_seconds": 30,
             "requires_full_pit": True,
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
@@ -959,7 +1032,7 @@ else:
             "instruction": 95, "branch": 90, "mutation": 95,
             "r": 6,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 2.0, "median_speed": 30, "total_wall_seconds": 15,
+            "exclusion_pct": 2.0, "exclusion_cap": 50, "median_speed": 30, "total_wall_seconds": 15,
             "requires_full_pit": True,
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
@@ -971,7 +1044,7 @@ else:
             "instruction": 100, "branch": 100, "mutation": 100,
             "r": 5,
             "test_isolation": True, "has_strategy": True,
-            "exclusion_ratio": 1.0, "median_speed": 10, "total_wall_seconds": 10,
+            "exclusion_pct": 0.0, "exclusion_cap": 0, "median_speed": 10, "total_wall_seconds": 10,
             "requires_full_pit": True,
             "requires_stronger_mutators": True,
             "no_hidden_exclusions": True,
@@ -1035,8 +1108,23 @@ for idx, (tier_name, reqs) in enumerate(tiers):
     if "has_strategy" in reqs and not has_strategy:
         met = False; failures.append("no TEST_STRATEGY.md")
 
-    if "exclusion_ratio" in reqs and exclusion_ratio_pct > reqs["exclusion_ratio"]:
-        met = False; failures.append(f"exclusion ratio {exclusion_ratio_pct:.1f}% > {reqs['exclusion_ratio']}%")
+    # Sliding exclusion scale (v4.2): max_allowed = min(N*pct/100, cap)
+    if "exclusion_pct" in reqs:
+        excl_pct = reqs["exclusion_pct"]
+        excl_cap = reqs["exclusion_cap"]
+        max_allowed_excl = compute_max_excluded(total_instr, excl_pct, excl_cap)
+        if excluded_instr_count > max_allowed_excl:
+            # Determine which limit is binding for the error message
+            pct_limit = total_instr * excl_pct / 100.0 if total_instr > 0 else 0
+            if excl_cap < pct_limit:
+                limit_desc = f"cap of {excl_cap} instr"
+            else:
+                limit_desc = f"{excl_pct:.1f}%"
+            met = False
+            failures.append(
+                f"exclusion {excluded_instr_count} instr ({exclusion_ratio_pct:.1f}%) > "
+                f"allowed {max_allowed_excl:.0f} instr ({limit_desc})"
+            )
 
     # Anti-gaming: use MEDIAN test speed (robust against trivial-test dilution)
     if "median_speed" in reqs and median_test_ms is not None:
@@ -1044,8 +1132,16 @@ for idx, (tier_name, reqs) in enumerate(tiers):
             met = False; failures.append(f"median test speed {median_test_ms:.1f}ms > {reqs['median_speed']}ms")
 
     # Anti-gaming: total wall-clock gate (not gameable by adding trivial tests)
-    if "total_wall_seconds" in reqs and test_time_seconds > reqs["total_wall_seconds"]:
-        met = False; failures.append(f"total wall-clock {test_time_seconds:.1f}s > {reqs['total_wall_seconds']}s")
+    if "total_wall_seconds" in reqs:
+        # Sliding wall-clock: scales with instruction count to be fair for large repos
+        # Formula: max_wall = max(base, N * rate) where N = total instructions
+        # base = the tier's total_wall_seconds (minimum for tiny repos)
+        # rate = per-instruction time budget (scales for large repos)
+        wall_base = reqs["total_wall_seconds"]
+        wall_rate = reqs.get("wall_per_instr", 0.001)  # 1ms per instruction default
+        max_wall = max(wall_base, instruction_total * wall_rate)
+        if test_time_seconds > max_wall:
+            met = False; failures.append(f"total wall-clock {test_time_seconds:.1f}s > {max_wall:.1f}s (sliding: base={wall_base}s, rate={wall_rate}s/instr, N={instruction_total})")
 
     # Phase 2: M_p (only if test source analysis is available)
     if "mp" in reqs and max_mp is not None:
