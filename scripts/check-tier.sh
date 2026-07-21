@@ -56,6 +56,7 @@ JUNIT_DIR=""
 INTEGRATION_JUNIT_DIR=""
 TEST_SRC_DIR=""
 PIT_CONFIG=""
+PROJECT_DIR=""
 FLOOR_TIER="Gold"
 
 while [ $# -gt 0 ]; do
@@ -68,6 +69,8 @@ while [ $# -gt 0 ]; do
             TEST_SRC_DIR="$2"; shift 2 ;;
         --pit-config)
             PIT_CONFIG="$2"; shift 2 ;;
+        --project-dir)
+            PROJECT_DIR="$2"; shift 2 ;;
         *)
             if [ -z "$JACOCO_XML" ]; then JACOCO_XML="$1"
             elif [ -z "$PIT_XML" ]; then PIT_XML="$1"
@@ -85,7 +88,7 @@ if [ ! -f "$JACOCO_XML" ]; then echo "ERROR: JaCoCo XML not found at $JACOCO_XML
 if [ ! -f "$PIT_XML" ]; then echo "ERROR: PIT XML not found at $PIT_XML"; exit 2; fi
 if ! command -v python3 >/dev/null 2>&1; then echo "ERROR: python3 is required"; exit 2; fi
 
-python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" "$TEST_SRC_DIR" "$PIT_CONFIG" << 'PYEOF'
+python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" "$TEST_SRC_DIR" "$PIT_CONFIG" "$PROJECT_DIR" << 'PYEOF'
 import xml.etree.ElementTree as ET
 import sys, os, glob, subprocess, re, json
 from collections import defaultdict
@@ -97,6 +100,40 @@ floor_tier = sys.argv[4] if len(sys.argv) > 4 else "Gold"
 integration_junit_dir = sys.argv[5] if len(sys.argv) > 5 else ""
 test_src_dir = sys.argv[6] if len(sys.argv) > 6 else ""
 pit_config_path = sys.argv[7] if len(sys.argv) > 7 else ""
+project_dir = sys.argv[8] if len(sys.argv) > 8 else ""
+
+# Base directory for TEST_STRATEGY.md and other project-relative lookups.
+# When --project-dir is provided, project files are searched there instead of CWD.
+strategy_base_dir = project_dir if project_dir else os.getcwd()
+
+def strategy_file_exists(filename):
+    """Check if a project file exists in the strategy base dir (or CWD as fallback)."""
+    if project_dir:
+        candidate = os.path.join(project_dir, filename)
+        if os.path.exists(candidate):
+            return True
+    return os.path.exists(filename)
+
+def strategy_file_path(filename):
+    """Return the path to a project file if it exists, else None."""
+    if project_dir:
+        candidate = os.path.join(project_dir, filename)
+        if os.path.exists(candidate):
+            return candidate
+    if os.path.exists(filename):
+        return filename
+    return None
+
+def read_strategy_file(filename):
+    """Read a project file from strategy base dir (or CWD as fallback). Returns content or empty string."""
+    path = strategy_file_path(filename)
+    if path:
+        try:
+            with open(path) as f:
+                return f.read()
+        except:
+            pass
+    return ""
 
 # ============ Parse JaCoCo ============
 jacoco_root = ET.parse(jacoco_path).getroot()
@@ -272,13 +309,7 @@ if pit_config:
     # Keep the XML-inferred check (has_full_matrix from line 110) as authoritative.
 
 # Read TEST_STRATEGY.md early (needed for exclusion checks below)
-strategy_content = ""
-if os.path.exists('TEST_STRATEGY.md'):
-    try:
-        with open('TEST_STRATEGY.md') as f:
-            strategy_content = f.read()
-    except:
-        pass
+strategy_content = read_strategy_file('TEST_STRATEGY.md')
 
 # Compute config violation flags for tier gating
 pit_excluded_classes = pit_config.get('excludedClasses', [])
@@ -418,8 +449,8 @@ for cls_name, tests in junit_test_classes.items():
             zero_kill_by_class[cls_name] += 1
 
 # ============ Test isolation + strategy ============
-test_isolation = os.path.exists('TEST_ISOLATION.md') or os.path.exists('TEST_STRATEGY.md')
-has_strategy = os.path.exists('TEST_STRATEGY.md')
+test_isolation = strategy_file_exists('TEST_ISOLATION.md') or strategy_file_exists('TEST_STRATEGY.md')
+has_strategy = strategy_file_exists('TEST_STRATEGY.md')
 
 # ============ PIT config: targetClasses / excludedClasses verification ============
 # Compare JaCoCo classes (production code with branches) against PIT mutated
@@ -441,13 +472,10 @@ for c in _all_jacoco_classes:
             no_mutation_classes.append(c.split('/')[-1])
 
 # Check TEST_STRATEGY.md for documented exclusions
-strategy_content = ""
-if os.path.exists('TEST_STRATEGY.md'):
-    try:
-        with open('TEST_STRATEGY.md') as f:
-            strategy_content = f.read()
-    except:
-        pass
+# (strategy_content already read early above — re-read in case it changed,
+# but this is the same file so just ensure it's populated)
+if not strategy_content:
+    strategy_content = read_strategy_file('TEST_STRATEGY.md')
 
 undocumented_excluded = [cls for cls in no_mutation_classes if cls not in strategy_content]
 
@@ -458,7 +486,8 @@ for pkg in jacoco_root.findall('package'):
         name = cls.get('name', '')
         if name: included_classes.add(name)
 
-class_dirs = ['gradle-tools/build/classes/kotlin/main', 'build/classes/kotlin/main', 'build/classes/java/main']
+class_dirs = ['gradle-tools/build/classes/kotlin/main', 'build/classes/kotlin/main', 'build/classes/java/main',
+              'build/classes/kotlin/jvm/main', 'build/classes/kotlin/desktop/main']
 excluded_instr_count = 0
 excluded_class_names = []
 
@@ -685,9 +714,10 @@ if test_src_dir and os.path.isdir(test_src_dir):
                 prod_methods.add(parts[1])
 
     # Also scan main source dir for additional production methods
-    main_src_dirs = ['src/main/kotlin', 'gradle-tools/src/main/kotlin']
+    main_src_dirs = ['src/main/kotlin', 'gradle-tools/src/main/kotlin',
+                     'src/commonMain/kotlin', 'src/jvmMain/kotlin']
     for msd in main_src_dirs:
-        full_msd = os.path.join(os.getcwd(), msd) if not os.path.isabs(msd) else msd
+        full_msd = os.path.join(strategy_base_dir, msd) if not os.path.isabs(msd) else msd
         if os.path.isdir(full_msd):
             for root_d, _, files in os.walk(full_msd):
                 for f in files:
