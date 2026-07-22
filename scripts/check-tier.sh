@@ -480,14 +480,26 @@ if not strategy_content:
 undocumented_excluded = [cls for cls in no_mutation_classes if cls not in strategy_content]
 
 # ============ Exclusion ratio ============
+# With unified XML, classes from BOTH Kover (JVM) and JaCoCo (instrumented)
+# appear in <class> elements. Classes covered by NEITHER are correctly flagged.
 included_classes = set()
 for pkg in jacoco_root.findall('package'):
     for cls in pkg.findall('class'):
         name = cls.get('name', '')
         if name: included_classes.add(name)
 
-class_dirs = ['gradle-tools/build/classes/kotlin/main', 'build/classes/kotlin/main', 'build/classes/java/main',
-              'build/classes/kotlin/jvm/main', 'build/classes/kotlin/desktop/main']
+# Class directories for JVM, Gradle plugin, Android, and KMP projects.
+# When --project-dir is provided, paths are resolved relative to it.
+class_dirs = ['gradle-tools/build/classes/kotlin/main',
+              'build/classes/kotlin/main', 'build/classes/java/main',
+              'build/classes/kotlin/jvm/main', 'build/classes/kotlin/desktop/main',
+              # KMP Android outputs
+              'build/tmp/kotlin-classes/debug',
+              'build/intermediates/javac/debug/classes',
+              'build/intermediates/runtime_library_classes_jar/debug/bundleLibRuntimeToJarDebug']
+# Resolve relative to project_dir when provided
+if project_dir:
+    class_dirs = [os.path.join(project_dir, d) if not os.path.isabs(d) else d for d in class_dirs]
 excluded_instr_count = 0
 excluded_class_names = []
 
