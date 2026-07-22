@@ -152,6 +152,19 @@ instruction_pct = instruction_covered * 100 / instruction_total if instruction_t
 branch_total = branch_missed + branch_covered
 branch_pct = branch_covered * 100 / branch_total if branch_total > 0 else 0
 
+# ============ Parse coverage scope metadata ============
+# The unified XML includes a <scope> element indicating whether Android
+# instrumented test data is included. If missing (older reports), assume
+# JVM-only for backward compatibility.
+_scope_elem = jacoco_root.find('scope')
+_has_android_tests = False
+if _scope_elem is not None:
+    _android_elem = _scope_elem.find('androidTests')
+    if _android_elem is not None and _android_elem.text:
+        _has_android_tests = _android_elem.text.strip().lower() == 'true'
+
+_is_jvm_only = not _has_android_tests
+
 # ============ Parse PIT ============
 pit_root = ET.parse(pit_path).getroot()
 is_partial = pit_root.get('partial', 'false').lower() == 'true'
@@ -888,6 +901,9 @@ print("=" * 60)
 print("ANVIL TESTING SYSTEM — Tier Report")
 print("=" * 60)
 print()
+if _is_jvm_only:
+    print("  WARNING: Coverage scope: JVM-only (no Android instrumented test data)")
+    print()
 print(f"  Instruction:      {instruction_covered}/{instruction_total} = {instruction_pct:.1f}%")
 print(f"  Branch:           {branch_covered}/{branch_total} = {branch_pct:.1f}%")
 print(f"  Mutation:         {killed_mutations}/{total_mutations} = {mutation_pct:.1f}%")
@@ -1230,7 +1246,8 @@ achieved_tier = tiers[highest_tier_idx][0] if highest_tier_idx >= 0 else "Below 
 
 print("=" * 60)
 r_mode = "R_direct" if use_r_direct else "R (fallback)"
-print(f"  TIER: {achieved_tier}  [{r_mode}]")
+scope_note = " (JVM-only)" if _is_jvm_only else ""
+print(f"  TIER: {achieved_tier}{scope_note}  [{r_mode}]")
 print("=" * 60)
 
 tier_order = ["Below Bronze", "Bronze", "Silver", "Gold", "Platinum", "Perfection"]
