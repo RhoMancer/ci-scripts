@@ -57,6 +57,7 @@ INTEGRATION_JUNIT_DIR=""
 TEST_SRC_DIR=""
 PIT_CONFIG=""
 PROJECT_DIR=""
+CLASS_DIRS_ARG=""
 FLOOR_TIER="Gold"
 
 while [ $# -gt 0 ]; do
@@ -71,6 +72,8 @@ while [ $# -gt 0 ]; do
             PIT_CONFIG="$2"; shift 2 ;;
         --project-dir)
             PROJECT_DIR="$2"; shift 2 ;;
+        --class-dirs)
+            CLASS_DIRS_ARG="$2"; shift 2 ;;
         *)
             if [ -z "$JACOCO_XML" ]; then JACOCO_XML="$1"
             elif [ -z "$PIT_XML" ]; then PIT_XML="$1"
@@ -88,7 +91,7 @@ if [ ! -f "$JACOCO_XML" ]; then echo "ERROR: JaCoCo XML not found at $JACOCO_XML
 if [ ! -f "$PIT_XML" ]; then echo "ERROR: PIT XML not found at $PIT_XML"; exit 2; fi
 if ! command -v python3 >/dev/null 2>&1; then echo "ERROR: python3 is required"; exit 2; fi
 
-python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" "$TEST_SRC_DIR" "$PIT_CONFIG" "$PROJECT_DIR" << 'PYEOF'
+python3 - "$JACOCO_XML" "$PIT_XML" "$JUNIT_DIR" "$FLOOR_TIER" "$INTEGRATION_JUNIT_DIR" "$TEST_SRC_DIR" "$PIT_CONFIG" "$PROJECT_DIR" "$CLASS_DIRS_ARG" << 'PYEOF'
 import xml.etree.ElementTree as ET
 import sys, os, glob, subprocess, re, json
 from collections import defaultdict
@@ -101,6 +104,7 @@ integration_junit_dir = sys.argv[5] if len(sys.argv) > 5 else ""
 test_src_dir = sys.argv[6] if len(sys.argv) > 6 else ""
 pit_config_path = sys.argv[7] if len(sys.argv) > 7 else ""
 project_dir = sys.argv[8] if len(sys.argv) > 8 else ""
+class_dirs_arg = sys.argv[9] if len(sys.argv) > 9 else ""
 
 # Base directory for TEST_STRATEGY.md and other project-relative lookups.
 # When --project-dir is provided, project files are searched there instead of CWD.
@@ -488,16 +492,37 @@ for pkg in jacoco_root.findall('package'):
         name = cls.get('name', '')
         if name: included_classes.add(name)
 
-# Class directories for JVM, Gradle plugin, Android, and KMP projects.
-# When --project-dir is provided, paths are resolved relative to it.
-class_dirs = ['gradle-tools/build/classes/kotlin/main',
-              'build/classes/kotlin/main', 'build/classes/java/main',
-              'build/classes/kotlin/jvm/main', 'build/classes/kotlin/desktop/main',
-              # KMP Android outputs
-              'build/tmp/kotlin-classes/debug',
-              'build/intermediates/javac/debug/classes',
-              'build/intermediates/runtime_library_classes_jar/debug/bundleLibRuntimeToJarDebug']
-# Resolve relative to project_dir when provided
+# Class directories for exclusion ratio computation.
+#
+# HOW THE EXCLUSION RATIO WORKS:
+# 1. The coverage XML (JaCoCo/Kover/unified) lists every class that coverage
+#    tools instrumented. These are "covered_classes."
+# 2. We walk compiled .class files on disk in the specified directories.
+# 3. For each .class NOT in covered_classes, we count its bytecode instructions.
+# 4. exclusion_ratio = excluded_instructions / (covered + excluded)
+#
+# WHAT IT CATCHES:
+#   A class hidden from BOTH Kover AND JaCoCo → missing from coverage XML → flagged.
+#   This is the gaming vector: hiding hard-to-test code from coverage reports.
+#
+# WHAT IT DOES NOT CATCH:
+#   A class excluded from Kover but still in JaCoCo → appears in unified XML → not flagged.
+#   A class excluded from JaCoCo but still in Kover → appears in unified XML → not flagged.
+#   One-sided exclusions are caught by PR review + PIT config verification gates.
+#
+# KMP SUPPORT:
+#   KMP compiles to multiple targets. If we scan ALL compiled directories,
+#   Android-only classes appear as false positives (not covered by JVM tests).
+#   The --class-dirs flag lets the caller specify exactly which directories to scan.
+#
+#   For single-target JVM projects (angus-gradle-tools): defaults work, no flag needed.
+#   For KMP projects (theming): pass --class-dirs with JVM output directory only.
+if class_dirs_arg:
+    class_dirs = class_dirs_arg.split(':')
+else:
+    class_dirs = ['gradle-tools/build/classes/kotlin/main',
+                  'build/classes/kotlin/main', 'build/classes/java/main',
+                  'build/classes/kotlin/jvm/main']
 if project_dir:
     class_dirs = [os.path.join(project_dir, d) if not os.path.isabs(d) else d for d in class_dirs]
 excluded_instr_count = 0
